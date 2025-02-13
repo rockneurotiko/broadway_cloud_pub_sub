@@ -8,7 +8,7 @@ defmodule BroadwayCloudPubSub.PullWorker do
   end
 
   def stop(server) do
-    GenServer.stop(server)
+    GenServer.call(server, :stop)
   end
 
   @impl true
@@ -31,11 +31,17 @@ defmodule BroadwayCloudPubSub.PullWorker do
     }
 
     send(self(), :pull_messages)
-    {:ok, state}
+    {:ok, state, {:continue, :pull_messages}}
   end
 
   @impl true
-  def handle_info(:pull_messages, %{current_request: nil} = state) do
+  def handle_call(:stop, _caller, state) do
+    cancel_request(state)
+
+    {:stop, :normal, :ok, clean_request_state(state)}
+  end
+
+  def do_pull_messages(%{current_request: nil} = state) do
     # Do not override start_time, so when there are retries it will calculate all
 
     state =
@@ -49,17 +55,26 @@ defmodule BroadwayCloudPubSub.PullWorker do
 
     request = send_pull_request(state)
 
-    {:noreply,
-     %{
-       state
-       | current_request: request,
-         data: [],
-         status: nil,
-         headers: nil
-     }}
+    %{
+      state
+      | current_request: request,
+        data: [],
+        status: nil,
+        headers: nil
+    }
   end
 
+  def do_pull_messages(state), do: state
+
+  @impl true
+  def handle_continue(:pull_messages, state) do
+    state = do_pull_messages(state)
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info(:pull_messages, state) do
+    state = do_pull_messages(state)
     {:noreply, state}
   end
 
@@ -90,11 +105,12 @@ defmodule BroadwayCloudPubSub.PullWorker do
     emit_metric(state, :exception)
 
     send(state.client, {self(), []})
-    {:stop, :normal, state}
+
+    {:stop, :normal, clean_request_state(state)}
   end
 
   def handle_info({:DOWN, ref, _, _, _}, %{current_request: ref} = state) do
-    {:stop, :normal, state}
+    {:stop, :normal, clean_request_state(state)}
   end
 
   defp emit_metric(state, :start) do
@@ -152,7 +168,7 @@ defmodule BroadwayCloudPubSub.PullWorker do
     send(state.client, {self(), messages})
 
     # Stop the GenServer after receiving messages
-    {:stop, :normal, state}
+    {:stop, :normal, clean_request_state(state)}
   end
 
   defp handle_response_done(%{status: status} = state) do
@@ -172,8 +188,12 @@ defmodule BroadwayCloudPubSub.PullWorker do
       {:error, reason} ->
         Logger.error("Unable to fetch events from Cloud Pub/Sub - reason: #{reason}")
         send(state.client, {self(), []})
-        {:stop, :normal, state}
+        {:stop, :normal, clean_request_state(state)}
     end
+  end
+
+  defp clean_request_state(state) do
+    %{state | current_request: nil}
   end
 
   defp maybe_retry(status, state) do
@@ -205,15 +225,22 @@ defmodule BroadwayCloudPubSub.PullWorker do
   end
 
   @impl true
-  def terminate(_reason, %{current_request: ref} = state) when not is_nil(ref) do
-    Finch.cancel_async_request(ref)
-
-    emit_metric(state, :exception)
+  def terminate(_reason, state) do
+    cancel_request(state)
 
     :ok
   end
 
-  def terminate(_reason, _state), do: :ok
+  defp cancel_request(%{current_request: ref} = state) when not is_nil(ref) do
+    emit_metric(state, :exception)
+
+    result = Finch.cancel_async_request(ref)
+    Logger.warning("CANCEL REQUEST #{inspect(result)}")
+
+    result
+  end
+
+  defp cancel_request(_), do: :ok
 
   defp send_pull_request(state) do
     max_messages = state.max_messages

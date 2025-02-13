@@ -103,6 +103,13 @@ defmodule BroadwayCloudPubSub.PullClientTest do
     finch = __MODULE__.Finch
     _ = start_supervised({Finch, name: finch})
 
+    on_exit(fn ->
+      :telemetry.detach(:start_handler)
+      :telemetry.detach(:stop_handler)
+      :telemetry.detach(:exception_handler)
+      :ok
+    end)
+
     {:ok, server: server, base_url: base_url, finch: finch}
   end
 
@@ -316,14 +323,11 @@ defmodule BroadwayCloudPubSub.PullClientTest do
       {:ok, opts} = base_opts |> Keyword.put(:max_number_of_messages, 5) |> PullClient.init()
       PullClient.receive_messages(10, & &1, opts)
 
-      assert_received {:start, metadata}
-      assert_received {:stop, measurements}
+      assert_receive {:start, metadata}, 500
+      assert_receive {:stop, measurements}, 500
       assert metadata.demand == 10
       assert metadata.max_messages == 5
       assert is_integer(measurements.duration)
-
-      :telemetry.detach(:start_handler)
-      :telemetry.detach(:stop_handler)
     end
   end
 
@@ -549,8 +553,8 @@ defmodule BroadwayCloudPubSub.PullClientTest do
       {:ok, opts} = base_opts |> Keyword.put(:max_number_of_messages, 5) |> PullClient.init()
       async_receive_messages(10, & &1, opts)
 
-      assert_received {:start, metadata}
-      assert_received {:stop, measurements}
+      assert_receive {:start, metadata}, 500
+      assert_receive {:stop, measurements}, 500
       assert metadata.demand == 10
       assert metadata.max_messages == 5
       assert is_integer(measurements.duration)
@@ -635,9 +639,9 @@ defmodule BroadwayCloudPubSub.PullClientTest do
 
       PullClient.acknowledge(["1", "2", "3"], opts)
 
-      assert_received {:start, metadata}
+      assert_receive {:start, metadata}, 500
       assert metadata.name == Broadway3
-      assert_received {:stop, measurements, metadata}
+      assert_receive {:stop, measurements, metadata}, 500
       assert is_integer(measurements.duration)
       assert metadata.name == Broadway3
 
