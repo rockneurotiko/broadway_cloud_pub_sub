@@ -206,6 +206,19 @@ defmodule BroadwayCloudPubSub.Producer do
     handle_receive_messages(%{state | receive_timer: nil})
   end
 
+  def handle_info(
+        {pull_pid, messages},
+        %{draining: true, pull_worker: pull_pid} = state
+      ) do
+    on_draining = {:nack, 10}
+    # Drain messages, not acknowledging them and setting the ack to draining_deadline
+    messages
+    |> Enum.map(&Broadway.Message.configure_ack(&1, on_success: on_draining))
+    |> Broadway.Message.ack_immediately()
+
+    {:noreply, [], %{state | worker_task: nil}}
+  end
+
   def handle_info({pull_pid, messages}, %{demand: demand, pull_worker: pull_pid} = state) do
     new_demand = demand - length(messages)
 
