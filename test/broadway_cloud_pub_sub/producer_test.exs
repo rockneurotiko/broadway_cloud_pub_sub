@@ -73,6 +73,23 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       end
     end
 
+    @impl Client
+    def async_receive_messages(parent_pid, amount, builder, opts) do
+      pid =
+        spawn(fn ->
+          msgs = receive_messages(amount, builder, opts)
+
+          send(parent_pid, {self(), msgs})
+        end)
+
+      {:ok, pid}
+    end
+
+    @impl Client
+    def stop_async_request(process) do
+      Process.exit(process, :brutal_kill)
+    end
+
     @impl Acknowledger
     def ack(_ack_ref, successful, _failed) do
       [%Message{acknowledger: {_, _, %{test_pid: test_pid}}} | _] = successful
@@ -112,6 +129,17 @@ defmodule BroadwayCloudPubSub.ProducerTest do
 
     @impl Client
     def receive_messages(_amount, _builder, _opts), do: []
+
+    @impl Client
+    def async_receive_messages(parent_pid, _amount, _builder, _opts) do
+      send(parent_pid, {self(), []})
+      {:ok, self()}
+    end
+
+    @impl Client
+    def stop_async_request(_process) do
+      :ok
+    end
   end
 
   defmodule Forwarder do
@@ -148,7 +176,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
     test ":subscription should be a string" do
       assert_raise(
         ValidationError,
-        "required option :subscription not found, received options: [:client]",
+        "required :subscription option not found, received options: []",
         fn ->
           prepare_for_start_module_opts([])
         end
@@ -266,7 +294,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
 
       assert_raise(
         ValidationError,
-        ~r/expected :max_number_of_messages to be a positive integer, got: 0/,
+        ~r"invalid value for :max_number_of_messages option: expected positive integer, got: 0",
         fn ->
           prepare_for_start_module_opts(
             goth: FakeAuth,
@@ -278,7 +306,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
 
       assert_raise(
         ValidationError,
-        ~r/expected :max_number_of_messages to be a positive integer, got: -1/,
+        ~r"invalid value for :max_number_of_messages option: expected positive integer, got: -1",
         fn ->
           prepare_for_start_module_opts(
             goth: FakeAuth,
@@ -326,7 +354,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert producer_opts[:token_generator] == token_generator
 
       assert_raise ValidationError,
-                   ~r/expected :token_generator to be a tuple {Mod, Fun, Args}, got: {1, 1, 1}/,
+                   "invalid value for :token_generator option: expected tuple {mod, fun, args}, got: {1, 1, 1}",
                    fn ->
                      prepare_for_start_module_opts(
                        subscription: "projects/foo/subscriptions/bar",
@@ -335,7 +363,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
                    end
 
       assert_raise ValidationError,
-                   ~r/expected :token_generator to be a tuple {Mod, Fun, Args}, got: SomeModule/,
+                   ~r"invalid value for :token_generator option: expected tuple {mod, fun, args}, got: SomeModule",
                    fn ->
                      prepare_for_start_module_opts(
                        subscription: "projects/foo/subscriptions/bar",

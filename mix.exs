@@ -32,12 +32,12 @@ defmodule BroadwayCloudPubSub.MixProject do
 
   defp deps do
     [
-      {:broadway, "~> 1.0"},
-      {:finch, "~> 0.9"},
+      {:broadway, "~> 1.1"},
+      {:finch, "~> 0.17"},
       {:jason, "~> 1.0"},
       {:nimble_options, "~> 0.3.7 or ~> 0.4 or ~> 1.0"},
       {:telemetry, "~> 0.4.3 or ~> 1.0"},
-      {:goth, "~> 1.3", optional: true},
+      {:goth, "~> 1.4", optional: true},
       {:ex_doc, "~> 0.23", only: :docs},
       {:bypass, "~> 2.1", only: :test}
     ]

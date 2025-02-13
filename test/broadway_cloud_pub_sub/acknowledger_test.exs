@@ -18,6 +18,17 @@ defmodule BroadwayCloudPubSub.AcknowledgerTest do
     def receive_messages(_demand, _ack_builder, _opts), do: []
 
     @impl Client
+    def async_receive_messages(parent_pid, _amount, _builder, _opts) do
+      send(parent_pid, {self(), []})
+      {:ok, self()}
+    end
+
+    @impl Client
+    def stop_async_request(_process) do
+      :ok
+    end
+
+    @impl Client
     def acknowledge(ack_ids, config) do
       send(config.test_pid, {:acknowledge, length(ack_ids)})
     end

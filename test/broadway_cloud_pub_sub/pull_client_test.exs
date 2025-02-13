@@ -327,6 +327,239 @@ defmodule BroadwayCloudPubSub.PullClientTest do
     end
   end
 
+  describe "async_receive_messages/3" do
+    setup %{server: server, base_url: base_url, finch: finch} do
+      test_pid = self()
+
+      on_pubsub_request(server, fn _url, _body ->
+        {:ok, @pull_response}
+      end)
+
+      %{
+        pid: test_pid,
+        opts: [
+          # will be injected by Broadway at runtime
+          broadway: [name: :Broadway3],
+          base_url: base_url,
+          finch: finch,
+          max_number_of_messages: 10,
+          subscription: "projects/foo/subscriptions/bar",
+          token_generator: {__MODULE__, :generate_token, []},
+          receive_timeout: :infinity,
+          max_retries: 0
+        ]
+      }
+    end
+
+    test "returns a list of ordered Broadway.Message with orderingKey in the :metadata", %{
+      opts: base_opts,
+      server: server
+    } do
+      on_pubsub_request(server, fn _url, _body ->
+        {:ok, @ordered_response}
+      end)
+
+      {:ok, opts} = PullClient.init(base_opts)
+
+      assert [message] = async_receive_messages(10, & &1, opts)
+
+      assert message.metadata.messageId == "19917247038"
+      assert message.metadata.orderingKey == "key1"
+    end
+
+    test "retries if the option is set", %{
+      opts: base_opts,
+      server: server
+    } do
+      multiple_errors_on_pubsub(server, error_count: 3, error_status: 502)
+
+      {:ok, opts} =
+        base_opts
+        |> Keyword.put(:max_retries, 3)
+        |> Keyword.put(:retry_delay_ms, 0)
+        |> Keyword.put(:retry_codes, [502])
+        |> PullClient.init()
+
+      assert [_message] = async_receive_messages(10, & &1, opts)
+    end
+
+    test "returns a list of Broadway.Message when payloadFormat is NONE", %{
+      opts: base_opts,
+      server: server
+    } do
+      on_pubsub_request(server, fn _, _ ->
+        {:ok, @no_payload_response}
+      end)
+
+      {:ok, opts} = PullClient.init(base_opts)
+
+      assert [message] = async_receive_messages(10, & &1, opts)
+      assert message.metadata.messageId == "20240501001"
+    end
+
+    test "returns a list of Broadway.Message with :data and :metadata set", %{
+      opts: base_opts
+    } do
+      {:ok, opts} = PullClient.init(base_opts)
+
+      [message1, message2, message3, message4] = async_receive_messages(10, & &1, opts)
+
+      assert %Message{data: "Message1", metadata: %{publishTime: %DateTime{}}} = message1
+
+      assert message1.metadata.messageId == "19917247034"
+      assert message1.metadata.deliveryAttempt == 1
+
+      assert %{
+               "foo" => "bar",
+               "qux" => ""
+             } = message1.metadata.attributes
+
+      assert message2.data == "Message2"
+      assert message2.metadata.messageId == "19917247035"
+      assert message2.metadata.attributes == %{}
+      assert message2.metadata.deliveryAttempt == 2
+
+      assert %Message{data: nil} = message3
+      assert message3.metadata.deliveryAttempt == 3
+
+      assert %{
+               "number" => "three"
+             } = message3.metadata.attributes
+
+      assert message4.metadata.publishTime == nil
+      assert message4.metadata.deliveryAttempt == nil
+    end
+
+    test "returns an empty list when an empty response is returned by the server", %{
+      opts: base_opts,
+      server: server
+    } do
+      on_pubsub_request(server, fn _, _ ->
+        {:ok, @empty_response}
+      end)
+
+      {:ok, opts} = PullClient.init(base_opts)
+
+      assert [] == async_receive_messages(10, & &1, opts)
+    end
+
+    test "if the request fails, returns an empty list and log the error", %{
+      opts: base_opts,
+      server: server
+    } do
+      on_pubsub_request(server, fn _, _ -> {:error, 403, @empty_response} end)
+
+      {:ok, opts} = PullClient.init(base_opts)
+
+      assert capture_log(fn ->
+               assert async_receive_messages(10, & &1, opts) == []
+             end) =~ "[error] Unable to fetch events from Cloud Pub/Sub - reason: "
+    end
+
+    test "send a projects.subscriptions.pull request with default options", %{opts: base_opts} do
+      {:ok, opts} = PullClient.init(base_opts)
+      async_receive_messages(10, & &1, opts)
+
+      assert_received {:http_request_called, %{body: body, url: url}}
+      assert body == %{"maxMessages" => 10}
+      assert url == base_opts[:base_url] <> "/v1/projects/foo/subscriptions/bar:pull"
+    end
+
+    test "request with custom :max_number_of_messages", %{opts: base_opts} do
+      {:ok, opts} = base_opts |> Keyword.put(:max_number_of_messages, 5) |> PullClient.init()
+      async_receive_messages(10, & &1, opts)
+
+      assert_received {:http_request_called, %{body: body, url: _url}}
+      assert body["maxMessages"] == 5
+    end
+
+    test "cancel request when stop_async_request is called", %{opts: base_opts, server: server} do
+      test_pid = self()
+
+      :telemetry.attach(
+        :start_handler,
+        [:broadway_cloud_pub_sub, :pull_client, :receive_messages, :start],
+        fn _name, _measurements, _metadata, _config ->
+          send(test_pid, :start)
+        end,
+        %{}
+      )
+
+      :telemetry.attach(
+        :exception_handler,
+        [:broadway_cloud_pub_sub, :pull_client, :receive_messages, :exception],
+        fn _name, measurements, metadata, _config ->
+          send(test_pid, {:exception, metadata, measurements})
+        end,
+        %{}
+      )
+
+      Bypass.expect(server, fn conn ->
+        send(test_pid, :http_request_called)
+        # Do not send response to simulate a hanging request
+        conn
+      end)
+
+      {:ok, opts} = PullClient.init(base_opts)
+
+      {:ok, req_pid} = PullClient.async_receive_messages(self(), 10, & &1, opts)
+
+      Process.monitor(req_pid)
+
+      assert_receive :start
+
+      assert_receive :http_request_called, 500
+
+      assert :ok == PullClient.stop_async_request(req_pid)
+
+      assert_receive {:DOWN, _ref, :process, ^req_pid, :normal}
+
+      assert_received {:exception, metadata, measurements}
+
+      assert metadata.demand == 10
+      assert metadata.max_messages == 10
+      assert is_integer(measurements.duration)
+
+      refute Process.alive?(req_pid)
+
+      refute_received {^req_pid, _}
+    end
+
+    test "exposes telemetry for pull requests", %{opts: base_opts} do
+      test_pid = self()
+
+      :telemetry.attach(
+        :start_handler,
+        [:broadway_cloud_pub_sub, :pull_client, :receive_messages, :start],
+        fn _name, _measurements, metadata, _config ->
+          send(test_pid, {:start, metadata})
+        end,
+        %{}
+      )
+
+      :telemetry.attach(
+        :stop_handler,
+        [:broadway_cloud_pub_sub, :pull_client, :receive_messages, :stop],
+        fn _name, measurements, _metadata, _config ->
+          send(test_pid, {:stop, measurements})
+        end,
+        %{}
+      )
+
+      {:ok, opts} = base_opts |> Keyword.put(:max_number_of_messages, 5) |> PullClient.init()
+      async_receive_messages(10, & &1, opts)
+
+      assert_received {:start, metadata}
+      assert_received {:stop, measurements}
+      assert metadata.demand == 10
+      assert metadata.max_messages == 5
+      assert is_integer(measurements.duration)
+
+      :telemetry.detach(:start_handler)
+      :telemetry.detach(:stop_handler)
+    end
+  end
+
   describe "acknowledge/2" do
     setup %{server: server, base_url: base_url, finch: finch} do
       test_pid = self()
@@ -662,5 +895,13 @@ defmodule BroadwayCloudPubSub.PullClientTest do
       receive_timeout: base_opts[:receive_timeout] || :infinity,
       topology_name: Broadway3
     })
+  end
+
+  defp async_receive_messages(demand, ack_builder, opts) do
+    {:ok, req_pid} = PullClient.async_receive_messages(self(), demand, ack_builder, opts)
+
+    assert_receive {^req_pid, messages}, 1000
+
+    messages
   end
 end

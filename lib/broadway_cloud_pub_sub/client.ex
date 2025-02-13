@@ -48,6 +48,24 @@ defmodule BroadwayCloudPubSub.Client do
               messages
 
   @doc """
+  Dispatches a [`pull`](https://cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions/pull) request asynchronously.
+
+  It will send messages to the client_pid with the format {process_pid, messages}.
+  """
+  @callback async_receive_messages(
+              client_pid :: pid,
+              demand :: pos_integer,
+              ack_builder :: (ack_id -> term),
+              opts :: any
+            ) ::
+              GenServer.on_start()
+
+  @doc """
+  Stop an async request previously started. If HTTP/2 is used, this will gracefully cancel the request on the server.
+  """
+  @callback stop_async_request(client_pid :: pid) :: GenServer.on_stop()
+
+  @doc """
   Dispatches a [`modifyAckDeadline`](https://cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions/modifyAckDeadline) request.
   """
   @callback put_deadline(ack_ids, ack_deadline, opts :: any) :: any

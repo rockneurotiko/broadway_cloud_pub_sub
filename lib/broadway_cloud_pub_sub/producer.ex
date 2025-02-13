@@ -150,7 +150,8 @@ defmodule BroadwayCloudPubSub.Producer do
        receive_interval: receive_interval,
        client: {client, config},
        ack_ref: ack_ref,
-       worker_task: nil
+       pull_worker: nil,
+       config: config
      }}
   end
 
@@ -205,7 +206,7 @@ defmodule BroadwayCloudPubSub.Producer do
     handle_receive_messages(%{state | receive_timer: nil})
   end
 
-  def handle_info({ref, messages}, %{demand: demand, worker_task: %{ref: ref}} = state) do
+  def handle_info({pull_pid, messages}, %{demand: demand, pull_worker: pull_pid} = state) do
     new_demand = demand - length(messages)
 
     receive_timer =
@@ -221,7 +222,7 @@ defmodule BroadwayCloudPubSub.Producer do
       end
 
     {:noreply, messages,
-     %{state | demand: new_demand, receive_timer: receive_timer, worker_task: nil}}
+     %{state | demand: new_demand, receive_timer: receive_timer, pull_worker: nil}}
   end
 
   @impl true
@@ -231,37 +232,48 @@ defmodule BroadwayCloudPubSub.Producer do
 
   @impl Producer
   def prepare_for_draining(state) do
-    if state.worker_task do
-      Task.shutdown(state.worker_task, :brutal_kill)
+    if state.pull_worker do
+      %{client: {client, _opts}} = state
+      client.stop_async_request(state.pull_worker)
     end
 
-    {:noreply, [], %{state | worker_task: nil, draining: true}}
+    {:noreply, [], %{state | pull_worker: nil, draining: true}}
   end
 
   defp handle_receive_messages(%{draining: true} = state) do
     {:noreply, [], state}
   end
 
-  defp handle_receive_messages(%{receive_timer: nil, demand: demand, worker_task: nil} = state)
+  defp handle_receive_messages(%{receive_timer: nil, demand: demand, pull_worker: nil} = state)
        when demand > 0 do
-    task = receive_messages_from_pubsub(state, demand)
+    %{client: {client, opts}, ack_ref: ack_ref} = state
 
-    {:noreply, [], %{state | worker_task: task}}
+    {:ok, pull_worker} =
+      client.async_receive_messages(self(), demand, Acknowledger.builder(ack_ref), opts)
+
+    {:noreply, [], %{state | pull_worker: pull_worker}}
+  end
+
+  defp handle_receive_messages(%{receive_timer: nil, demand: demand, pull_worker: worker} = state)
+       when demand > 0 and not is_nil(worker) do
+    {:noreply, [], state}
   end
 
   defp handle_receive_messages(state) do
     {:noreply, [], state}
   end
 
-  defp receive_messages_from_pubsub(state, total_demand) do
-    %{client: {client, opts}, ack_ref: ack_ref} = state
-
-    Task.async(fn ->
-      client.receive_messages(total_demand, Acknowledger.builder(ack_ref), opts)
-    end)
-  end
-
   defp schedule_receive_messages(interval) do
     Process.send_after(self(), :receive_messages, interval)
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    if state.pull_worker do
+      %{client: {client, _opts}} = state
+      client.stop_async_request(state.pull_worker)
+    end
+
+    :ok
   end
 end

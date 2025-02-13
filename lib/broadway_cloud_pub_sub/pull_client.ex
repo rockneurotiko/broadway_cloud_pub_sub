@@ -69,6 +69,30 @@ defmodule BroadwayCloudPubSub.PullClient do
   end
 
   @impl Client
+  def async_receive_messages(client_pid, demand, ack_builder, config) do
+    max_retries = max_retries(config)
+    retry_codes = retry_codes(config)
+    retry_delay = retry_delay(config)
+
+    BroadwayCloudPubSub.PullWorker.start_link(%{
+        client: client_pid,
+        config: config,
+        max_retries: max_retries,
+        retry_codes: retry_codes,
+        retry_delay: retry_delay,
+        ack_builder: ack_builder,
+        demand: demand,
+        max_messages: min(demand, config.max_number_of_messages),
+        metric_prefix: [:broadway_cloud_pub_sub, :pull_client, :receive_messages]
+      })
+  end
+
+  @impl Client
+  def stop_async_request(process_pid) do
+    BroadwayCloudPubSub.PullWorker.stop(process_pid)
+  end
+
+  @impl Client
   def put_deadline(ack_ids, ack_deadline_seconds, config) do
     payload = %{
       "ackIds" => ack_ids,
@@ -205,7 +229,9 @@ defmodule BroadwayCloudPubSub.PullClient do
         {:ok, Jason.decode!(body)}
 
       {:ok, %Response{} = resp} ->
-        maybe_retry(resp, url, body, headers, config, action, payload, retries_left)
+
+          maybe_retry(resp, url, body, headers, config, action, payload, retries_left)
+
 
       {:error, err} ->
         {:error, format_error(url, err)}
