@@ -9,6 +9,7 @@ Documentation can be found at [https://hexdocs.pm/broadway_cloud_pub_sub](https:
 This project provides:
 
 * `BroadwayCloudPubSub.Producer` - A GenStage producer that continuously receives messages from a Pub/Sub subscription acknowledges them after being successfully processed.
+* `BroadwayCloudPubSub.Streaming.Producer` - A GenStage producer that uses the gRPC StreamingPull API for low-latency, push-based message delivery.
 * `BroadwayCloudPubSub.Client` - A generic behaviour to implement Pub/Sub clients.
 * `BroadwayCloudPubSub.PullClient` - Default REST client used by `BroadwayCloudPubSub.Producer`.
 
@@ -27,6 +28,19 @@ end
 
 > Note the [goth](https://hexdocs.pm/goth) package, which handles Google Authentication, is required for the default token generator.
 
+If you are using `BroadwayCloudPubSub.Streaming.Producer`, also add the gRPC dependencies:
+
+```elixir
+def deps do
+  [
+    {:broadway_cloud_pub_sub, "~> 0.10.0"},
+    {:goth, "~> 1.3"},
+    {:grpc, "~> 0.9"},
+    {:protobuf, "~> 0.12"}
+  ]
+end
+```
+
 ## Usage
 
 Configure Broadway with one or more producers using `BroadwayCloudPubSub.Producer`:
@@ -42,6 +56,51 @@ Broadway.start_link(MyBroadway,
   ]
 )
 ```
+
+## Streaming Usage
+
+For lower latency and higher throughput workloads, use `BroadwayCloudPubSub.Streaming.Producer`.
+It opens a persistent bidirectional gRPC stream to Pub/Sub and receives messages as the server
+pushes them, rather than polling via HTTP.
+
+```elixir
+Broadway.start_link(MyBroadway,
+  name: MyBroadway,
+  producer: [
+    module: {BroadwayCloudPubSub.Streaming.Producer,
+      goth: MyGoth,
+      subscription: "projects/my-project/subscriptions/my-subscription",
+      max_outstanding_messages: 1000
+    }
+  ]
+)
+```
+
+### gRPC adapter
+
+The streaming producer supports two HTTP/2 adapters, both provided by the `grpc` dependency:
+
+- `:gun` (default) — Uses the [Gun](https://github.com/ninenines/gun) HTTP/2 client. This is the
+  traditional adapter and works out of the box with the standard `grpc` dependency.
+- `:mint` — Uses the [Mint](https://github.com/elixir-mint/mint) HTTP/2 client. Mint may be
+  preferable in environments where Gun is not available or not desired.
+
+```elixir
+Broadway.start_link(MyBroadway,
+  name: MyBroadway,
+  producer: [
+    module: {BroadwayCloudPubSub.Streaming.Producer,
+      goth: MyGoth,
+      subscription: "projects/my-project/subscriptions/my-subscription",
+      adapter: :mint
+    }
+  ]
+)
+```
+
+See `BroadwayCloudPubSub.Streaming.Producer` for the full list of configuration options,
+including flow control (`max_outstanding_messages`, `max_outstanding_bytes`), reconnection
+backoff, and shutdown behaviour.
 
 ## License
 

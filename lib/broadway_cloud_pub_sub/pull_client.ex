@@ -3,7 +3,7 @@ defmodule BroadwayCloudPubSub.PullClient do
   A subscriptions [pull client](https://cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions/pull) built on `Finch`.
   """
   alias Broadway.Message
-  alias BroadwayCloudPubSub.Client
+  alias BroadwayCloudPubSub.{Client, MessageBuilder}
   alias Finch.Response
 
   require Logger
@@ -142,13 +142,14 @@ defmodule BroadwayCloudPubSub.PullClient do
       |> decode_message()
       |> Map.pop("data")
 
-    metadata = %{
-      attributes: metadata["attributes"],
-      deliveryAttempt: delivery_attempt,
-      messageId: metadata["messageId"],
-      orderingKey: metadata["orderingKey"],
-      publishTime: parse_datetime(metadata["publishTime"])
-    }
+    metadata =
+      MessageBuilder.build_metadata(%{
+        message_id: metadata["messageId"],
+        ordering_key: metadata["orderingKey"],
+        publish_time: parse_datetime(metadata["publishTime"]),
+        delivery_attempt: delivery_attempt,
+        attributes: metadata["attributes"]
+      })
 
     %Message{
       data: data,
