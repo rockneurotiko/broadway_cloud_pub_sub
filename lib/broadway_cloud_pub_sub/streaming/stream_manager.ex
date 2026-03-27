@@ -11,32 +11,65 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   #     lease management and shutdown nacking
   #   - Extend message leases periodically via modifyAckDeadline
   #   - Buffer ack/nack requests during reconnection and replay on connect
+  #   - Buffer incoming messages when the producer has no pending demand
+  #     (demand-based backpressure via notify_demand/1)
+  #   - Send keep-alive pings every 30s to prevent server idle timeout
+  #     (matches the Go pingTicker and Python Heartbeater behaviour)
   #
-  # Implementation note on gRPC adapter support:
-  #   This module supports two gRPC HTTP/2 adapters: Gun and Mint.
+  # Backpressure design:
+  #   The producer calls notify_demand/2 whenever Broadway signals new demand,
+  #   passing the total accumulated demand count. StreamManager keeps a
+  #   `pending_demand` integer. When `pending_demand` is 0, incoming messages
+  #   are stored in `message_buffer` instead of being forwarded. On each
+  #   notify_demand/2 or incoming gRPC batch, up to `pending_demand` messages
+  #   are flushed to the producer with the rest remaining buffered. The buffer
+  #   is naturally bounded by `max_outstanding_messages` (the Pub/Sub server
+  #   will not push more unacked messages than that limit).
   #
-  #   Gun (default): GRPC.Client.Adapters.Gun calls :gun.post/3 from the calling
-  #   process, making it the gun message owner. Raw {:gun_response,...},
-  #   {:gun_data,...} etc. messages arrive in this GenServer's mailbox and are
-  #   handled in handle_info/2. Manual gRPC frame decoding is done in-process
-  #   via recv_buffer.
+  # gRPC streaming:
+  #   A dedicated `StreamReader` process owns the gRPC stream for both the
+  #   Gun and Mint adapters. The reader calls `GRPC.Stub.recv/2` and forwards
+  #   decoded messages back as `{:stream_messages, msgs}`. See `StreamReader`
+  #   for a detailed explanation of why a separate process is needed and how
+  #   both adapters behave identically from this module's perspective.
   #
-  #   Mint: GRPC.Client.Adapters.Mint handles all framing internally via its
-  #   ConnectionProcess and StreamResponseProcess. A linked reader process calls
-  #   GRPC.Stub.recv/2 to enumerate decoded messages and forwards them back as
-  #   {:mint_messages, msgs}. Only {:elixir_grpc, :connection_down, conn_pid}
-  #   arrives in this process directly from Mint.
-  #   The GenServer traps exits so reader process crashes are handled gracefully.
+  # Keep-alive pings:
+  #   Google's servers close idle StreamingPull connections after ~60 seconds
+  #   of inactivity. Both the official Go (pingTicker) and Python (Heartbeater)
+  #   libraries send an empty StreamingPullRequest every 30 seconds to prevent
+  #   this. We do the same via the :send_keepalive timer. The timer is started
+  #   when the stream opens and cancelled when it closes.
+  #
+  # Reconnect deduplication:
+  #   Multiple events can arrive close together on a disconnect — e.g.
+  #   {:stream_error} followed by {:stream_closed} or an {:EXIT} signal.
+  #   Without deduplication, each would schedule a separate :connect message,
+  #   causing two concurrent connection attempts. We track the pending reconnect
+  #   timer ref in `reconnect_ref` and skip scheduling if one is already set.
+  #
+  # Error classification:
+  #   gRPC errors are classified as :retryable (reconnect) or :terminal (stop).
+  #   Terminal errors (NOT_FOUND, PERMISSION_DENIED, etc.) indicate a permanent
+  #   misconfiguration; retrying forever would be counterproductive. The GenServer
+  #   stops with {:terminal_error, reason} and Broadway's supervision restarts it,
+  #   which will surface the error via normal OTP crash reporting.
+  #
+  # Skip-backoff optimisation:
+  #   If a stream error arrives quickly after the stream opened, we apply the
+  #   full exponential backoff. If the stream was alive for >30s before failing
+  #   (meaning the server already had time to send a DEADLINE_EXCEEDED), we skip
+  #   the backoff sleep and reconnect immediately — matching the Go optimisation.
 
   use GenServer
   require Logger
 
   alias BroadwayCloudPubSub.{Backoff, MessageBuilder}
-  alias Google.Pubsub.V1.{StreamingPullRequest, StreamingPullResponse}
-  alias Google.Pubsub.V1.Subscriber.Stub
+  alias BroadwayCloudPubSub.Streaming.{ErrorClassifier, StreamReader}
+  alias Google.Pubsub.V1.StreamingPullRequest
 
-  # Maximum acks to buffer while reconnecting
-  @max_ack_buffer 10_000
+  # Default keep-alive interval — matches Go's pingTicker and Python's Heartbeater.
+  # The server's inactivity timeout is ~60s; pinging at half that prevents closure.
+  @default_keepalive_ms 30_000
 
   defstruct [
     :producer_pid,
@@ -44,16 +77,31 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     :channel,
     :grpc_stream,
     :conn_pid,
-    :stream_ref,
-    # Mint-only: pid of the linked reader process that enumerates GRPC.Stub.recv/2
+    # Pid of the linked StreamReader process that enumerates GRPC.Stub.recv/2
     :reader_pid,
     :backoff,
     :lease_timer,
     :lease_extension_interval_ms,
     :receiving,
-    # Gun-only: binary buffer for reassembling gRPC length-prefixed frames
-    recv_buffer: <<>>,
+    # Timer ref for the pending :connect message. Non-nil means a reconnect is
+    # already scheduled — prevents double-scheduling from multiple close signals.
+    :reconnect_ref,
+    # Timer ref for the periodic :send_keepalive message.
+    :keepalive_timer,
+    # Monotonic timestamp (ms) of when the current stream was opened.
+    # Used for the skip-backoff optimisation: if the stream ran >30s before
+    # failing, we skip the backoff sleep and reconnect immediately.
+    :stream_opened_at,
     outstanding: MapSet.new(),
+    # Messages buffered while the producer has no pending demand.
+    # Naturally bounded by max_outstanding_messages (server-side flow control).
+    message_buffer: [],
+    # How many messages the producer can currently accept.
+    # Refreshed on each notify_demand/2; decremented when messages are flushed.
+    pending_demand: 0,
+    # Ack/nack requests buffered while the gRPC stream is down (reconnecting).
+    # Replayed in FIFO order on successful reconnect. Naturally bounded by
+    # max_outstanding_messages — no more acks can arrive than messages delivered.
     ack_buffer: [],
     ack_buffer_size: 0
   ]
@@ -125,6 +173,18 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     GenServer.call(pid, :close, 10_000)
   end
 
+  @doc """
+  Signals the current demand from the producer. The `amount` is the producer's
+  total accumulated demand (not a delta). The StreamManager uses it as an upper
+  bound for how many buffered messages to flush immediately.
+
+  Called by `Streaming.Producer.handle_demand/2`.
+  """
+  @spec notify_demand(pid(), non_neg_integer()) :: :ok
+  def notify_demand(pid, amount) when is_integer(amount) and amount >= 0 do
+    GenServer.cast(pid, {:demand_available, amount})
+  end
+
   # --- GenServer callbacks ---
 
   @impl GenServer
@@ -148,7 +208,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       config: config,
       backoff: backoff,
       lease_extension_interval_ms: lease_extension_interval_ms,
-      receiving: true
+      receiving: true,
+      pending_demand: 0
     }
 
     # Delay connecting until producer tells us its pid via set_producer/2
@@ -157,156 +218,103 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   @impl GenServer
   def handle_info(:connect, state) do
+    # Clear the reconnect_ref — we are now executing the scheduled connect.
+    state = %{state | reconnect_ref: nil}
+
     case connect(state) do
       {:ok, new_state} ->
         {:noreply, new_state}
 
       {:error, reason, new_state} ->
-        log_connection_failure(reason)
         emit_telemetry(:connection_failure, %{reason: reason}, state.config)
         {:noreply, schedule_reconnect(new_state)}
     end
   end
 
-  # --- Raw Gun protocol messages ---
+  # The StreamReader successfully opened the gRPC stream and sends us the
+  # stream struct so we can call send_request for acks and lease extensions.
+  def handle_info({:stream_opened, reader_pid, grpc_stream}, %{reader_pid: reader_pid} = state) do
+    conn_pid = grpc_stream.channel.adapter_payload.conn_pid
+    backoff = Backoff.reset(state.backoff)
 
-  # Initial HTTP/2 response headers (200 OK) — connection established
-  def handle_info({:gun_response, conn_pid, stream_ref, :nofin, 200, _headers}, state)
-      when state.conn_pid == conn_pid and state.stream_ref == stream_ref do
-    {:noreply, state}
-  end
+    pre_flush_state = %{
+      state
+      | grpc_stream: grpc_stream,
+        conn_pid: conn_pid,
+        backoff: backoff,
+        stream_opened_at: now_ms()
+    }
 
-  # Non-200 initial response — treat as error
-  def handle_info({:gun_response, conn_pid, stream_ref, _fin, status, _headers}, state)
-      when state.conn_pid == conn_pid and state.stream_ref == stream_ref do
-    Logger.error("[StreamManager] gRPC stream got HTTP status #{status}")
-    {:noreply, schedule_reconnect(reset_connection(state))}
-  end
+    case flush_ack_buffer(pre_flush_state) do
+      {:ok, state} ->
+        state = schedule_lease_timer(state)
+        state = schedule_keepalive_timer(state)
+        emit_telemetry(:connect, %{}, state.config)
+        {:noreply, state}
 
-  # Catch-all for gun_response not matching our stream (e.g. different conn/ref)
-  def handle_info({:gun_response, conn_pid, stream_ref, fin, status, _headers}, state) do
-    Logger.debug(
-      "[StreamManager] Ignoring stale gun_response: conn=#{inspect(conn_pid)} ref=#{inspect(stream_ref)} fin=#{inspect(fin)} status=#{status} (state conn=#{inspect(state.conn_pid)} ref=#{inspect(state.stream_ref)})"
-    )
-
-    {:noreply, state}
-  end
-
-  # Data chunk(s) from the server
-  def handle_info({:gun_data, conn_pid, stream_ref, fin, data}, state)
-      when state.conn_pid == conn_pid and state.stream_ref == stream_ref do
-    buffer = state.recv_buffer <> data
-    {messages, remaining_buffer} = decode_grpc_messages(buffer)
-
-    state = %{state | recv_buffer: remaining_buffer}
-
-    state =
-      if state.receiving and messages != [] do
-        broadway_messages = Enum.map(messages, &build_broadway_message(&1, state))
-        ack_ids = Enum.map(messages, & &1.ack_id)
-        new_outstanding = Enum.reduce(ack_ids, state.outstanding, &MapSet.put(&2, &1))
-        emit_telemetry(:receive_messages, %{count: length(broadway_messages)}, state.config)
-        send(state.producer_pid, {:stream_messages, broadway_messages})
-        %{state | outstanding: new_outstanding}
-      else
-        state
-      end
-
-    if fin == :fin do
-      {:noreply, schedule_reconnect(reset_connection(state))}
-    else
-      {:noreply, state}
+      {:error, reason, state} ->
+        {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
     end
   end
 
-  # Catch-all for gun_data not matching our stream
-  def handle_info({:gun_data, conn_pid, stream_ref, _fin, _data} = _msg, state) do
-    Logger.debug(
-      "[StreamManager] Ignoring stale gun_data: conn=#{inspect(conn_pid)} ref=#{inspect(stream_ref)} (state conn=#{inspect(state.conn_pid)} ref=#{inspect(state.stream_ref)})"
-    )
-
+  # Stale :stream_opened from a previous reader (race during reconnect) — ignore.
+  def handle_info({:stream_opened, _pid, _stream}, state) do
     {:noreply, state}
   end
 
-  # Trailers — stream ended normally
-  def handle_info({:gun_trailers, conn_pid, stream_ref, trailers}, state)
-      when state.conn_pid == conn_pid and state.stream_ref == stream_ref do
-    grpc_status = trailers |> List.keyfind("grpc-status", 0) |> elem(1)
-    grpc_message = trailers |> List.keyfind("grpc-message", 0, {"", ""}) |> elem(1)
-
-    case grpc_status do
-      "0" ->
-        :ok
-
-      status ->
-        Logger.warning(
-          "[StreamManager] gRPC stream closed with status #{status}: #{grpc_message}"
-        )
-    end
-
-    emit_telemetry(:disconnect, %{reason: :stream_closed}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state))}
-  end
-
-  # Stream-level error
-  def handle_info({:gun_error, conn_pid, stream_ref, reason}, state)
-      when state.conn_pid == conn_pid and state.stream_ref == stream_ref do
-    Logger.warning("[StreamManager] gRPC stream error: #{inspect(reason)}")
-    emit_telemetry(:disconnect, %{reason: reason}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state))}
-  end
-
-  # Connection-level error/down
-  def handle_info({:gun_down, conn_pid, _protocol, reason, _killed_streams}, state)
-      when state.conn_pid == conn_pid do
-    Logger.warning("[StreamManager] gRPC connection down: #{inspect(reason)}")
-    emit_telemetry(:disconnect, %{reason: reason}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state))}
-  end
-
-  # --- Mint adapter messages ---
-
-  # Decoded messages forwarded from the Mint reader process
-  def handle_info({:mint_messages, messages}, state) do
+  # Decoded messages forwarded from the StreamReader
+  def handle_info({:stream_messages, messages}, state) do
     if state.receiving and messages != [] do
       broadway_messages = Enum.map(messages, &build_broadway_message(&1, state))
       ack_ids = Enum.map(messages, & &1.ack_id)
       new_outstanding = Enum.reduce(ack_ids, state.outstanding, &MapSet.put(&2, &1))
       emit_telemetry(:receive_messages, %{count: length(broadway_messages)}, state.config)
-      send(state.producer_pid, {:stream_messages, broadway_messages})
-      {:noreply, %{state | outstanding: new_outstanding}}
+      {:noreply, deliver_messages(%{state | outstanding: new_outstanding}, broadway_messages)}
     else
       {:noreply, state}
     end
   end
 
-  # Error reported by the Mint reader process (stream-level gRPC error)
-  def handle_info({:mint_stream_error, error}, state) do
-    Logger.warning("[StreamManager] Mint stream error: #{inspect(error)}")
-    emit_telemetry(:disconnect, %{reason: error}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state))}
+  # Stream-level gRPC error reported by the StreamReader.
+  # Classify: retryable errors trigger reconnect; terminal errors stop the GenServer.
+  def handle_info({:stream_error, error}, state) do
+    case ErrorClassifier.classify(error) do
+      :terminal ->
+        Logger.error("Terminal Cloud Pub/Sub gRPC error — stopping: #{inspect(error)}")
+
+        emit_telemetry(:terminal_error, %{reason: error}, state.config)
+        {:stop, {:terminal_error, error}, close_stream(state)}
+
+      :retryable ->
+        emit_telemetry(:disconnect, %{reason: error}, state.config)
+        {:noreply, schedule_reconnect(reset_connection(state, error))}
+    end
   end
 
-  # Connection-down message sent by the Mint adapter's ConnectionProcess
-  def handle_info({:elixir_grpc, :connection_down, conn_pid}, state)
-      when state.conn_pid == conn_pid do
-    Logger.warning("[StreamManager] Mint gRPC connection down")
-    emit_telemetry(:disconnect, %{reason: :connection_down}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state))}
-  end
-
-  # Mint reader process exited normally — stream ended, reconnect
-  def handle_info({:EXIT, pid, :normal}, %{reader_pid: pid} = state) do
-    Logger.info("[StreamManager] Mint reader stream ended normally")
+  # Server closed the stream normally (StreamReader enumeration exhausted)
+  def handle_info({:stream_closed}, state) do
     emit_telemetry(:disconnect, %{reason: :stream_closed}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state))}
+    {:noreply, schedule_reconnect(reset_connection(state, :stream_closed))}
   end
 
-  # Mint reader process crashed — reconnect
+  # StreamReader process exited normally — stream ended cleanly.
+  # {:stream_closed} is sent before the exit, so this is a duplicate signal.
+  # We only reconnect if grpc_stream is still set (meaning the stream_closed
+  # message wasn't processed first).
+  def handle_info({:EXIT, pid, :normal}, %{reader_pid: pid} = state) do
+    if state.grpc_stream do
+      emit_telemetry(:disconnect, %{reason: :stream_closed}, state.config)
+      {:noreply, schedule_reconnect(reset_connection(state, :stream_closed))}
+    else
+      # Already handled by {:stream_closed} — just clear the reader_pid
+      {:noreply, %{state | reader_pid: nil}}
+    end
+  end
+
+  # StreamReader process crashed — reconnect
   def handle_info({:EXIT, pid, reason}, %{reader_pid: pid} = state) do
-    Logger.warning("[StreamManager] Mint reader crashed: #{inspect(reason)}")
     emit_telemetry(:disconnect, %{reason: reason}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state))}
+    {:noreply, schedule_reconnect(reset_connection(state, reason))}
   end
 
   # Catch-all for other EXIT signals (e.g. from the supervisor during shutdown)
@@ -323,18 +331,60 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       deadline = state.config.stream_ack_deadline_seconds
       deadlines = List.duplicate(deadline, length(ack_ids))
 
-      send_on_stream(state.grpc_stream, %StreamingPullRequest{
-        modify_deadline_ack_ids: ack_ids,
-        modify_deadline_seconds: deadlines
-      })
+      case send_on_stream(state.grpc_stream, %StreamingPullRequest{
+             modify_deadline_ack_ids: ack_ids,
+             modify_deadline_seconds: deadlines
+           }) do
+        :ok ->
+          timer = Process.send_after(self(), :extend_leases, state.lease_extension_interval_ms)
+          {:noreply, %{state | lease_timer: timer}}
 
-      timer = Process.send_after(self(), :extend_leases, state.lease_extension_interval_ms)
-      {:noreply, %{state | lease_timer: timer}}
+        {:error, reason} ->
+          {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
+      end
     end
   end
 
-  def handle_info(msg, state) do
-    Logger.warning("[StreamManager] Unhandled message: #{inspect(msg)}")
+  # Periodic keep-alive ping: send an empty StreamingPullRequest to prevent the
+  # server from closing an idle stream. Matches Go's pingTicker (30s) and Python's
+  # Heartbeater (30s). The server's inactivity timeout is ~60s; pinging at half
+  # that gives a comfortable margin.
+  def handle_info(:send_keepalive, %{grpc_stream: nil} = state) do
+    # Stream is disconnected — don't ping, but reschedule for when it reconnects.
+    # (Timer will be cancelled and restarted by close_stream/schedule_keepalive_timer.)
+    {:noreply, state}
+  end
+
+  def handle_info(:send_keepalive, state) do
+    case send_on_stream(state.grpc_stream, %StreamingPullRequest{}) do
+      :ok ->
+        timer = schedule_keepalive_after(state.config)
+        {:noreply, %{state | keepalive_timer: timer}}
+
+      {:error, reason} ->
+        {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
+    end
+  end
+
+  # Mint adapter signals connection loss to its parent process.
+  # When the test (or the real stack) routes this signal to StreamManager,
+  # treat it the same as a stream error: reset and reconnect.
+  def handle_info({:elixir_grpc, :connection_down, conn_pid}, %{conn_pid: conn_pid} = state) do
+    emit_telemetry(:disconnect, %{reason: :connection_down}, state.config)
+    {:noreply, schedule_reconnect(reset_connection(state, :connection_down))}
+  end
+
+  # Gun adapter signals connection loss via :gun_down messages.
+  # Guard on the stored conn_pid to ignore stale/other connections.
+  def handle_info(
+        {:gun_down, conn_pid, _protocol, _reason, _killed_streams},
+        %{conn_pid: conn_pid} = state
+      ) do
+    emit_telemetry(:disconnect, %{reason: :connection_down}, state.config)
+    {:noreply, schedule_reconnect(reset_connection(state, :connection_down))}
+  end
+
+  def handle_info(_msg, state) do
     {:noreply, state}
   end
 
@@ -343,16 +393,18 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     new_outstanding = Enum.reduce(ack_ids, state.outstanding, &MapSet.delete(&2, &1))
     state = %{state | outstanding: new_outstanding}
 
-    state =
-      if state.grpc_stream do
-        send_on_stream(state.grpc_stream, %StreamingPullRequest{ack_ids: ack_ids})
-        emit_telemetry(:ack, %{count: length(ack_ids)}, state.config)
-        state
-      else
-        buffer_ack_request(state, {:ack, ack_ids})
-      end
+    if state.grpc_stream do
+      case send_on_stream(state.grpc_stream, %StreamingPullRequest{ack_ids: ack_ids}) do
+        :ok ->
+          emit_telemetry(:ack, %{count: length(ack_ids)}, state.config)
+          {:noreply, state}
 
-    {:noreply, state}
+        {:error, reason} ->
+          {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
+      end
+    else
+      {:noreply, buffer_ack_request(state, {:ack, ack_ids})}
+    end
   end
 
   def handle_cast({:modify_deadline, ack_ids, deadline_seconds}, state) do
@@ -366,19 +418,31 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     deadlines = List.duplicate(deadline_seconds, length(ack_ids))
     state = %{state | outstanding: new_outstanding}
 
-    state =
-      if state.grpc_stream do
-        send_on_stream(state.grpc_stream, %StreamingPullRequest{
-          modify_deadline_ack_ids: ack_ids,
-          modify_deadline_seconds: deadlines
-        })
+    if state.grpc_stream do
+      case send_on_stream(state.grpc_stream, %StreamingPullRequest{
+             modify_deadline_ack_ids: ack_ids,
+             modify_deadline_seconds: deadlines
+           }) do
+        :ok ->
+          {:noreply, state}
 
-        state
-      else
-        buffer_ack_request(state, {:modify_deadline, ack_ids, deadline_seconds})
+        {:error, reason} ->
+          {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
       end
+    else
+      {:noreply, buffer_ack_request(state, {:modify_deadline, ack_ids, deadline_seconds})}
+    end
+  end
 
-    {:noreply, state}
+  # The producer signals its current total demand. Update pending_demand and
+  # flush up to that many buffered messages to the producer.
+  def handle_cast({:demand_available, amount}, %{message_buffer: []} = state) do
+    {:noreply, %{state | pending_demand: amount}}
+  end
+
+  def handle_cast({:demand_available, amount}, state) do
+    state = %{state | pending_demand: amount}
+    {:noreply, flush_demand(state)}
   end
 
   @impl GenServer
@@ -397,15 +461,22 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   def handle_call(:close, _from, state) do
-    state = flush_ack_buffer(state)
+    # Best-effort: flush buffered acks before closing. Errors are ignored
+    # because we're shutting down regardless.
+    state =
+      case flush_ack_buffer(state) do
+        {:ok, s} -> s
+        {:error, _reason, s} -> %{s | ack_buffer: [], ack_buffer_size: 0}
+      end
+
     state = close_stream(state)
     {:reply, :ok, state}
   end
 
   @impl GenServer
-  def terminate(reason, state) do
-    Logger.debug("[StreamManager] terminate: reason=#{inspect(reason)}")
+  def terminate(_reason, state) do
     cancel_lease_timer(state)
+    cancel_keepalive_timer(state)
     close_stream(state)
     :ok
   end
@@ -417,87 +488,52 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
          {:ok, channel} <- open_channel(config, token) do
       connect_stream(channel, state)
     end
-  end
-
-  # Second phase of connect: open the gRPC stream on the already-open channel.
-  # Separated so that if open_stream raises, we can disconnect the channel
-  # before propagating the error (preventing stale Gun messages in our mailbox).
-  defp connect_stream(channel, %{config: config} = state) do
-    {:ok, grpc_stream, conn_pid, stream_ref} = open_stream(channel, state)
-    backoff = Backoff.reset(state.backoff)
-
-    state =
-      flush_ack_buffer(%{
-        state
-        | channel: channel,
-          grpc_stream: grpc_stream,
-          conn_pid: conn_pid,
-          stream_ref: stream_ref,
-          recv_buffer: <<>>,
-          backoff: backoff
-      })
-
-    state = maybe_start_reader(state)
-    state = schedule_lease_timer(state)
-    emit_telemetry(:connect, %{}, config)
-    {:ok, state}
   rescue
     e ->
-      # open_stream may raise (Stub.streaming_pull / send_request don't
-      # return error tuples). If it raised, no gRPC stream was successfully
-      # opened, so only disconnect the channel to prevent its Gun/Mint
-      # connection from delivering stale messages to our mailbox.
+      {:error, {:connect_failed, Exception.message(e)}, state}
+  end
+
+  # Opens the gRPC channel and spawns the StreamReader, which will open the
+  # stream and send {:stream_opened, reader_pid, grpc_stream} back to us.
+  # The actual grpc_stream struct is stored on {:stream_opened} receipt, not here.
+  defp connect_stream(channel, state) do
+    reader_pid = StreamReader.start_link(self(), channel, state.config)
+
+    {:ok,
+     %{
+       state
+       | channel: channel,
+         reader_pid: reader_pid,
+         grpc_stream: nil,
+         conn_pid: nil
+     }}
+  rescue
+    e ->
       try do
         GRPC.Stub.disconnect(channel)
       catch
         _, _ -> :ok
       end
 
-      {:error, {:open_stream_raised, Exception.message(e)}, state}
+      {:error, {:connect_failed, Exception.message(e)}, state}
   end
-
-  # For Mint: spawn a linked reader process that enumerates GRPC.Stub.recv/2 and
-  # forwards decoded messages back to the StreamManager.
-  defp maybe_start_reader(%{config: %{adapter: :mint}, grpc_stream: grpc_stream} = state) do
-    manager = self()
-
-    pid =
-      spawn_link(fn ->
-        {:ok, enum} = GRPC.Stub.recv(grpc_stream)
-
-        enum
-        |> Stream.each(fn
-          {:ok, %StreamingPullResponse{received_messages: msgs}} when msgs != [] ->
-            send(manager, {:mint_messages, msgs})
-
-          {:ok, %StreamingPullResponse{}} ->
-            # Heartbeat / empty response — nothing to forward
-            :ok
-
-          {:error, error} ->
-            send(manager, {:mint_stream_error, error})
-        end)
-        |> Stream.run()
-
-        # Stream exhausted normally. The reader exits :normal and StreamManager
-        # will receive {:EXIT, reader_pid, :normal} due to trap_exit.
-      end)
-
-    %{state | reader_pid: pid}
-  end
-
-  defp maybe_start_reader(state), do: state
-
-  defp adapter_module(:gun), do: GRPC.Client.Adapters.Gun
-  defp adapter_module(:mint), do: GRPC.Client.Adapters.Mint
 
   defp open_channel(
-         %{grpc_endpoint: endpoint, use_ssl: use_ssl, adapter: adapter} = _config,
+         %{grpc_endpoint: endpoint, use_ssl: use_ssl, adapter: adapter} = config,
          token
        ) do
+    adapter_mod =
+      case adapter do
+        :gun -> GRPC.Client.Adapters.Gun
+        :mint -> GRPC.Client.Adapters.Mint
+      end
+
+    keepalive_interval_ms = Map.get(config, :keepalive_interval_ms, 30_000)
+
     base_opts = [
-      adapter: adapter_module(adapter),
-      headers: [{"authorization", "Bearer #{token}"}]
+      adapter: adapter_mod,
+      headers: [{"authorization", "Bearer #{token}"}],
+      adapter_opts: [http2_opts: %{keepalive: keepalive_interval_ms, settings_timeout: :infinity}]
     ]
 
     opts =
@@ -514,135 +550,96 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     end
   end
 
-  defp open_stream(channel, state) do
-    config = state.config
-    client_id = Map.fetch!(config, :client_id)
-
-    initial_request = %StreamingPullRequest{
-      subscription: config.subscription,
-      stream_ack_deadline_seconds: config.stream_ack_deadline_seconds,
-      max_outstanding_messages: config.max_outstanding_messages,
-      max_outstanding_bytes: config.max_outstanding_bytes,
-      client_id: client_id
-    }
-
-    grpc_stream = Stub.streaming_pull(channel, [])
-    grpc_stream = GRPC.Stub.send_request(grpc_stream, initial_request)
-
-    # Both adapters store the connection process pid in adapter_payload.conn_pid,
-    # but the stream_ref field only exists for Gun.
-    conn_pid = grpc_stream.channel.adapter_payload.conn_pid
-
-    case config.adapter do
-      :gun ->
-        stream_ref = grpc_stream.payload.stream_ref
-        {:ok, grpc_stream, conn_pid, stream_ref}
-
-      :mint ->
-        {:ok, grpc_stream, conn_pid, nil}
-    end
-  end
-
-  # Decode one or more GRPC length-prefixed messages from the buffer.
-  # Returns {[StreamingPullResponse.received_messages], remaining_buffer}
-  defp decode_grpc_messages(buffer) do
-    decode_grpc_messages(buffer, [])
-  end
-
-  defp decode_grpc_messages(buffer, acc) do
-    case GRPC.Message.get_message(buffer) do
-      {{_flag, encoded}, rest} ->
-        case StreamingPullResponse.decode(encoded) do
-          %StreamingPullResponse{received_messages: msgs} when msgs != [] ->
-            decode_grpc_messages(rest, Enum.reverse(msgs, acc))
-
-          %StreamingPullResponse{} ->
-            # Heartbeat/empty response
-            decode_grpc_messages(rest, acc)
-        end
-
-      false ->
-        {Enum.reverse(acc), buffer}
-    end
-  end
-
   defp send_on_stream(grpc_stream, request) do
-    try do
-      GRPC.Stub.send_request(grpc_stream, request)
-    catch
-      kind, reason ->
-        Logger.warning("[StreamManager] Failed to send on stream: #{kind} #{inspect(reason)}")
-    end
+    GRPC.Stub.send_request(grpc_stream, request)
+    :ok
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
-  defp reset_connection(state) do
-    close_stream(state)
+  defp reset_connection(state, reason) do
+    # Drop buffered (not-yet-delivered) messages on disconnect. Their ack_ids are
+    # in `outstanding`, so extract and remove them before closing the stream to
+    # avoid pointless lease-extension attempts for messages that will be redelivered.
+    buffered_ack_ids =
+      state.message_buffer
+      |> Enum.map(fn %Broadway.Message{acknowledger: {_, _, %{ack_id: id}}} -> id end)
+
+    new_outstanding =
+      Enum.reduce(buffered_ack_ids, state.outstanding, &MapSet.delete(&2, &1))
+
+    # Preserve `pending_demand` across reconnection. The producer's demand counter
+    # survives the disconnect and it won't re-signal demand it already sent.
+    # Clearing pending_demand here would cause a demand deadlock: the producer has
+    # pending demand but thinks it already notified us, while we lost the count.
+    # Buffered messages are dropped (the server will redeliver them), but demand
+    # state must carry over so the reconnected stream can deliver immediately.
+    #
+    # Record the disconnect reason so schedule_reconnect can apply the skip-backoff
+    # optimisation: if the stream was alive for >30s, reconnect without delay.
+    close_stream(
+      %{
+        state
+        | message_buffer: [],
+          outstanding: new_outstanding,
+          stream_opened_at: state.stream_opened_at,
+          # carry stream_opened_at through for the skip-backoff check
+          reconnect_ref: state.reconnect_ref
+      },
+      reason
+    )
   end
 
-  defp close_stream(%{grpc_stream: nil} = state), do: stop_reader(state)
+  # Overload that does not carry a reason (used by close_stream directly)
+  defp close_stream(%{reader_pid: nil, grpc_stream: nil} = state), do: state
 
-  defp close_stream(%{grpc_stream: grpc_stream, channel: channel, conn_pid: conn_pid} = state) do
-    state = stop_reader(state)
-
-    # Cancel the stream (sends RST_STREAM) so Gun stops forwarding data for
-    # this stream_ref. end_stream/1 only half-closes the client side and leaves
-    # the server free to keep sending.
-    try do
-      GRPC.Stub.cancel(grpc_stream)
-    catch
-      _, _ -> :ok
+  defp close_stream(%{reader_pid: reader_pid, grpc_stream: grpc_stream, channel: channel} = state) do
+    # Stop the reader first so it doesn't send more messages while we clean up.
+    # Unlink before killing to prevent the EXIT signal from triggering reconnect.
+    if is_pid(reader_pid) do
+      Process.unlink(reader_pid)
+      Process.exit(reader_pid, :kill)
     end
 
-    if channel do
+    if grpc_stream do
       try do
-        GRPC.Stub.disconnect(channel)
+        GRPC.Stub.cancel(grpc_stream)
       catch
         _, _ -> :ok
       end
     end
 
-    # Force-kill the underlying Gun process synchronously. :gun.shutdown (called
-    # by GRPC.Stub.disconnect) is an async cast with a 15-second graceful close
-    # period during which Gun continues delivering messages to our mailbox.
-    # Killing it immediately eliminates that race window.
-    if is_pid(conn_pid), do: Process.exit(conn_pid, :kill)
+    if channel do
+      # Only call disconnect if the underlying connection process is alive.
+      # When the server closes the channel (e.g. after DEADLINE_EXCEEDED), the
+      # adapter's connection process may already be gone. Calling disconnect on a
+      # dead channel causes a FunctionClauseError inside grpc's GenServer.
+      conn_alive? =
+        case state.conn_pid do
+          pid when is_pid(pid) -> Process.alive?(pid)
+          _ -> true
+        end
 
-    # Drain any gun messages from conn_pid that were already in our mailbox
-    # before the process died.
-    flush_gun_messages(conn_pid)
-
-    %{state | grpc_stream: nil, channel: nil, conn_pid: nil, stream_ref: nil, recv_buffer: <<>>}
-  end
-
-  # Kills the Mint reader process (if any) and removes it from state.
-  # Unlinks before killing so the EXIT signal does not trigger reconnect logic.
-  defp stop_reader(%{reader_pid: pid} = state) when is_pid(pid) do
-    Process.unlink(pid)
-    Process.exit(pid, :kill)
-    %{state | reader_pid: nil}
-  end
-
-  defp stop_reader(state), do: state
-
-  # Drains any Gun messages from a specific conn_pid that are already sitting
-  # in our mailbox. We pin on ^conn_pid so we never accidentally consume
-  # messages from a newly-opened connection. The after 0 makes this
-  # non-blocking — it only removes messages already present.
-  defp flush_gun_messages(conn_pid) when is_pid(conn_pid) do
-    receive do
-      {:gun_up, ^conn_pid, _} -> flush_gun_messages(conn_pid)
-      {:gun_down, ^conn_pid, _, _, _} -> flush_gun_messages(conn_pid)
-      {:gun_response, ^conn_pid, _, _, _, _} -> flush_gun_messages(conn_pid)
-      {:gun_data, ^conn_pid, _, _, _} -> flush_gun_messages(conn_pid)
-      {:gun_trailers, ^conn_pid, _, _} -> flush_gun_messages(conn_pid)
-      {:gun_error, ^conn_pid, _, _} -> flush_gun_messages(conn_pid)
-      {:gun_error, ^conn_pid, _} -> flush_gun_messages(conn_pid)
-    after
-      0 -> :ok
+      if conn_alive? do
+        try do
+          GRPC.Stub.disconnect(channel)
+        catch
+          _, _ -> :ok
+        end
+      end
     end
+
+    # Cancel the keep-alive timer — it will be restarted when the new stream opens.
+    state = cancel_keepalive_timer(state)
+
+    %{state | reader_pid: nil, grpc_stream: nil, channel: nil, conn_pid: nil}
   end
 
-  defp flush_gun_messages(_), do: :ok
+  # close_stream with a reason — delegates to the main close_stream but also
+  # stores the reason for the skip-backoff optimisation in schedule_reconnect.
+  defp close_stream(state, _reason) do
+    close_stream(state)
+  end
 
   # --- Private: backoff ---
 
@@ -650,12 +647,41 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     raise "StreamManager failed to connect and backoff is :stop — crashing"
   end
 
-  defp schedule_reconnect(%{backoff: backoff} = state) do
-    {timeout, new_backoff} = Backoff.backoff(backoff)
-    Logger.info("[StreamManager] Reconnecting in #{timeout}ms")
-    Process.send_after(self(), :connect, timeout)
-    %{state | backoff: new_backoff}
+  # Deduplication: if a :connect message is already pending, do not schedule
+  # another one. This prevents the double-reconnect race where {:stream_error}
+  # and {:stream_closed} (or {:EXIT}) both arrive within a single disconnect.
+  defp schedule_reconnect(%{reconnect_ref: ref} = state) when not is_nil(ref) do
+    state
   end
+
+  defp schedule_reconnect(%{backoff: backoff, stream_opened_at: opened_at} = state) do
+    {timeout, new_backoff} = Backoff.backoff(backoff)
+
+    # Skip-backoff optimisation (matches Go's behaviour):
+    # If the stream was alive for more than 30 seconds before failing, the server
+    # had time to process a DEADLINE_EXCEEDED (or similar timeout). Adding a
+    # backoff delay on top of the already-long blocking period compounds the
+    # reconnect latency unnecessarily. Reconnect immediately instead.
+    effective_timeout =
+      if skip_backoff?(opened_at) do
+        0
+      else
+        timeout
+      end
+
+    ref = Process.send_after(self(), :connect, effective_timeout)
+    %{state | backoff: new_backoff, reconnect_ref: ref}
+  end
+
+  # Returns true if the stream was open long enough that we should skip the
+  # exponential backoff sleep. Threshold: 30 seconds (same as Go).
+  defp skip_backoff?(nil), do: false
+
+  defp skip_backoff?(opened_at) do
+    now_ms() - opened_at >= 30_000
+  end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   # --- Private: lease management ---
 
@@ -672,41 +698,94 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     %{state | lease_timer: nil}
   end
 
+  # --- Private: keep-alive ---
+
+  defp schedule_keepalive_timer(state) do
+    state = cancel_keepalive_timer(state)
+    timer = schedule_keepalive_after(state.config)
+    %{state | keepalive_timer: timer}
+  end
+
+  defp schedule_keepalive_after(config) do
+    interval = Map.get(config, :keepalive_interval_ms, @default_keepalive_ms)
+    Process.send_after(self(), :send_keepalive, interval)
+  end
+
+  defp cancel_keepalive_timer(%{keepalive_timer: nil} = state), do: state
+
+  defp cancel_keepalive_timer(%{keepalive_timer: timer} = state) do
+    Process.cancel_timer(timer)
+    %{state | keepalive_timer: nil}
+  end
+
   # --- Private: ack buffering ---
 
   defp buffer_ack_request(%{ack_buffer: buffer, ack_buffer_size: size} = state, request) do
-    if size < @max_ack_buffer do
-      %{state | ack_buffer: [request | buffer], ack_buffer_size: size + 1}
-    else
-      Logger.warning("[StreamManager] Ack buffer full, dropping oldest ack request")
-      %{state | ack_buffer: [request | Enum.drop(buffer, -1)]}
+    emit_telemetry(:ack_buffered, %{buffer_size: size + 1}, state.config)
+    %{state | ack_buffer: [request | buffer], ack_buffer_size: size + 1}
+  end
+
+  defp flush_ack_buffer(%{ack_buffer: [], grpc_stream: _} = state), do: {:ok, state}
+
+  defp flush_ack_buffer(%{ack_buffer: _buffer, grpc_stream: nil} = state), do: {:ok, state}
+
+  defp flush_ack_buffer(%{ack_buffer: buffer, grpc_stream: grpc_stream} = state) do
+    result =
+      buffer
+      |> Enum.reverse()
+      |> Enum.reduce_while(:ok, fn entry, :ok ->
+        request =
+          case entry do
+            {:ack, ack_ids} ->
+              %StreamingPullRequest{ack_ids: ack_ids}
+
+            {:modify_deadline, ack_ids, deadline_seconds} ->
+              deadlines = List.duplicate(deadline_seconds, length(ack_ids))
+
+              %StreamingPullRequest{
+                modify_deadline_ack_ids: ack_ids,
+                modify_deadline_seconds: deadlines
+              }
+          end
+
+        case send_on_stream(grpc_stream, request) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+
+    case result do
+      :ok -> {:ok, %{state | ack_buffer: [], ack_buffer_size: 0}}
+      {:error, reason} -> {:error, reason, state}
     end
   end
 
-  defp flush_ack_buffer(%{ack_buffer: [], grpc_stream: _} = state), do: state
+  # --- Private: message building ---
 
-  defp flush_ack_buffer(%{ack_buffer: _buffer, grpc_stream: nil} = state), do: state
-
-  defp flush_ack_buffer(%{ack_buffer: buffer, grpc_stream: grpc_stream} = state) do
-    buffer
-    |> Enum.reverse()
-    |> Enum.each(fn
-      {:ack, ack_ids} ->
-        send_on_stream(grpc_stream, %StreamingPullRequest{ack_ids: ack_ids})
-
-      {:modify_deadline, ack_ids, deadline_seconds} ->
-        deadlines = List.duplicate(deadline_seconds, length(ack_ids))
-
-        send_on_stream(grpc_stream, %StreamingPullRequest{
-          modify_deadline_ack_ids: ack_ids,
-          modify_deadline_seconds: deadlines
-        })
-    end)
-
-    %{state | ack_buffer: [], ack_buffer_size: 0}
+  # Buffer incoming messages, then flush up to pending_demand to the producer.
+  # Returns updated state.
+  defp deliver_messages(state, messages) do
+    # Prepend for O(1); reversed on flush.
+    new_buffer = Enum.reduce(messages, state.message_buffer, fn msg, acc -> [msg | acc] end)
+    flush_demand(%{state | message_buffer: new_buffer})
   end
 
-  # --- Private: message building ---
+  # Flush up to `pending_demand` messages from the buffer to the producer.
+  # If the buffer is empty or pending_demand is 0, this is a no-op.
+  defp flush_demand(%{pending_demand: 0} = state), do: state
+  defp flush_demand(%{message_buffer: []} = state), do: state
+
+  defp flush_demand(state) do
+    all_messages = Enum.reverse(state.message_buffer)
+    to_send = min(state.pending_demand, length(all_messages))
+    {batch, rest} = Enum.split(all_messages, to_send)
+
+    send(state.producer_pid, {:stream_messages, batch})
+
+    # Store remainder back in reversed (prepend-friendly) order
+    reversed_rest = Enum.reverse(rest)
+    %{state | message_buffer: reversed_rest, pending_demand: state.pending_demand - to_send}
+  end
 
   defp build_broadway_message(
          %{ack_id: ack_id, message: pubsub_msg, delivery_attempt: delivery_attempt},
@@ -754,8 +833,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   defp emit_telemetry(event, measurements, config) do
     metadata = %{
-      subscription: config.subscription,
-      config: config
+      name: config.broadway[:name],
+      subscription: config.subscription
     }
 
     :telemetry.execute(
@@ -763,9 +842,5 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       measurements,
       metadata
     )
-  end
-
-  defp log_connection_failure(reason) do
-    Logger.error("[StreamManager] Failed to connect: #{inspect(reason)}")
   end
 end

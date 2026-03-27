@@ -52,10 +52,14 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   ## Differences from BroadwayCloudPubSub.Producer
 
-    * **Push-based**: Messages arrive via a persistent gRPC stream rather than
-      being polled. `handle_demand` is a no-op.
+    * **Push-based with demand signaling**: Messages arrive via a persistent gRPC
+      stream. The producer tracks GenStage demand from downstream consumers and
+      signals StreamManager when capacity is available. StreamManager buffers
+      messages internally when demand is zero, preventing unbounded mailbox growth.
     * **Flow control**: Controlled by `max_outstanding_messages` / `max_outstanding_bytes`
       on the gRPC stream rather than by `max_number_of_messages` per HTTP request.
+      This is the primary backpressure mechanism — the Pub/Sub server will not push
+      more than `max_outstanding_messages` unacked messages.
     * **Shutdown**: By default, unprocessed messages are returned to Pub/Sub with a
       short delay (`on_shutdown: {:nack, 5}`), analogous to AMQP channel close behavior.
 
@@ -89,10 +93,22 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
       Measurements: `%{reason: term()}`
 
+    * `[:broadway_cloud_pub_sub, :stream, :terminal_error]` - Emitted when a
+      non-retryable gRPC error is received (e.g. NOT_FOUND, PERMISSION_DENIED).
+      The StreamManager will stop after this event is emitted.
+
+      Measurements: `%{reason: term()}`
+
+    * `[:broadway_cloud_pub_sub, :stream, :ack_buffered]` - Emitted when an
+      ack/nack request is buffered because the gRPC stream is temporarily
+      unavailable (e.g. during reconnection).
+
+      Measurements: `%{buffer_size: non_neg_integer()}`
+
   All events include the following metadata:
 
+    * `:name` - the Broadway topology name
     * `:subscription` - the full subscription name
-    * `:config` - the producer configuration
 
   """
 
@@ -147,20 +163,21 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     ack_config = %{on_success: config.on_success, on_failure: config.on_failure}
     :persistent_term.put(ack_ref, {manager_pid, ack_config})
 
-    buffer_size = config.max_outstanding_messages * 5
-
-    {:producer, %{manager_pid: manager_pid, ack_ref: ack_ref, config: config, draining: false},
-     buffer_size: buffer_size}
+    {:producer,
+     %{manager_pid: manager_pid, ack_ref: ack_ref, config: config, draining: false, demand: 0}}
   end
 
   @impl GenStage
-  def handle_demand(_demand, state) do
-    {:noreply, [], state}
+  def handle_demand(incoming_demand, %{demand: demand} = state) do
+    new_demand = demand + incoming_demand
+    StreamManager.notify_demand(state.manager_pid, new_demand)
+    {:noreply, [], %{state | demand: new_demand}}
   end
 
   @impl GenStage
-  def handle_info({:stream_messages, messages}, state) do
-    {:noreply, messages, state}
+  def handle_info({:stream_messages, messages}, %{demand: demand} = state) do
+    new_demand = max(demand - length(messages), 0)
+    {:noreply, messages, %{state | demand: new_demand}}
   end
 
   @impl GenStage

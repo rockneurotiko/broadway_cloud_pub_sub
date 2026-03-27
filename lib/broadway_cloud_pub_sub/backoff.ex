@@ -63,7 +63,7 @@ defmodule BroadwayCloudPubSub.Backoff do
 
   def backoff(%__MODULE__{type: :rand_exp, min: _min, max: max, state: {prev, lower, seed}} = b) do
     next_min = min(prev, lower)
-    next_max = min(prev * 3, max)
+    next_max = min(prev * 2, max)
     {timeout, seed} = rand(next_min, next_max, seed)
     {timeout, %{b | state: {min(next_max, max), lower, seed}}}
   end

@@ -76,7 +76,7 @@ defmodule BroadwayCloudPubSub.Streaming.ProducerIntegrationTest do
   end
 
   setup_all do
-    {:ok, _} = DynamicSupervisor.start_link(strategy: :one_for_one, name: GRPC.Client.Supervisor)
+    DynamicSupervisor.start_link(strategy: :one_for_one, name: GRPC.Client.Supervisor)
     PubSubEmulator.start()
     :ok
   end

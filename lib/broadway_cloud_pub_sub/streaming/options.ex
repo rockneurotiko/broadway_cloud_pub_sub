@@ -10,6 +10,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
   @default_lease_extension_percent 0.6
   @default_backoff_min 1_000
   @default_backoff_max 30_000
+  @default_keepalive_interval_ms 30_000
 
   definition = [
     # Handled by Broadway.
@@ -147,6 +148,18 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       default: @default_backoff_max,
       doc: "Maximum reconnection backoff in milliseconds. Defaults to 30000."
     ],
+    keepalive_interval_ms: [
+      type: :pos_integer,
+      default: @default_keepalive_interval_ms,
+      doc: """
+      Interval in milliseconds at which HTTP/2 PING frames are sent on the gRPC
+      connection to keep it alive. This prevents Google Cloud's load balancer
+      from closing idle connections (which it does after roughly 20 seconds by
+      default). Matches the 30-second keepalive interval used by the official
+      Python and Go Pub/Sub client libraries. Only applies to the `:gun` adapter.
+      Defaults to 30000.
+      """
+    ],
     adapter: [
       type: {:in, [:gun, :mint]},
       default: :gun,
@@ -158,7 +171,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
         * `:mint` — Uses the Mint HTTP/2 client. Mint may be preferable in
           deployment environments where Gun is not available or not desired.
 
-      Both adapters are provided by the `grpc` dependency. The adapter choice
+      Both adapters are provided by the `grpc_client` dependency. The adapter choice
       does not affect the public API or message semantics.
       """
     ],

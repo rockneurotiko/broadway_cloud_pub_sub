@@ -38,7 +38,10 @@ defmodule BroadwayCloudPubSub.MixProject do
       {:nimble_options, "~> 0.3.7 or ~> 0.4 or ~> 1.0"},
       {:telemetry, "~> 0.4.3 or ~> 1.0"},
       {:goth, "~> 1.3", optional: true},
-      {:grpc, "~> 0.9 or ~> 0.10 or ~> 0.11", optional: true},
+      # TODO: Replace with Hex versions when grpc 1.0 is released
+      {:grpc_core,
+       github: "elixir-grpc/grpc", sparse: "grpc_core", optional: true, override: true},
+      {:grpc_client, github: "elixir-grpc/grpc", sparse: "grpc_client", optional: true},
       {:protobuf, "~> 0.12 or ~> 0.13 or ~> 0.14 or ~> 0.15 or ~> 0.16", optional: true},
       {:ex_doc, "~> 0.23", only: :docs},
       {:bypass, "~> 2.1", only: :test}
