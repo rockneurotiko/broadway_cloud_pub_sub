@@ -25,8 +25,8 @@ defmodule BroadwayCloudPubSub.BackoffTest do
 
     test "uses default min and max when not provided" do
       b = Backoff.new()
-      assert b.min == 1_000
-      assert b.max == 30_000
+      assert b.min == 100
+      assert b.max == 60_000
     end
 
     test "accepts custom min and max" do

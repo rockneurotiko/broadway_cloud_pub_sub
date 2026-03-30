@@ -27,12 +27,25 @@ defmodule BroadwayCloudPubSub.Streaming.ErrorClassifierTest do
       assert ErrorClassifier.classify(rpc_error(14)) == :retryable
     end
 
+    test "UNAVAILABLE (14) with 'Server shutdownNow invoked' is retryable" do
+      assert ErrorClassifier.classify(rpc_error(14, "Server shutdownNow invoked")) == :retryable
+    end
+
+    test "UNAVAILABLE (14) with message containing shutdown string is retryable" do
+      assert ErrorClassifier.classify(rpc_error(14, "prefix Server shutdownNow invoked suffix")) ==
+               :retryable
+    end
+
     test "UNKNOWN (2) is retryable" do
       assert ErrorClassifier.classify(rpc_error(2)) == :retryable
     end
 
     test "RESOURCE_EXHAUSTED (8) is retryable" do
       assert ErrorClassifier.classify(rpc_error(8)) == :retryable
+    end
+
+    test "UNAUTHENTICATED (16) is retryable" do
+      assert ErrorClassifier.classify(rpc_error(16)) == :retryable
     end
   end
 
@@ -49,21 +62,8 @@ defmodule BroadwayCloudPubSub.Streaming.ErrorClassifierTest do
       assert ErrorClassifier.classify(rpc_error(3)) == :terminal
     end
 
-    test "UNAUTHENTICATED (16) is terminal" do
-      assert ErrorClassifier.classify(rpc_error(16)) == :terminal
-    end
-
     test "CANCELLED (1) is terminal" do
       assert ErrorClassifier.classify(rpc_error(1)) == :terminal
-    end
-
-    test "UNAVAILABLE (14) with 'Server shutdownNow invoked' is terminal" do
-      assert ErrorClassifier.classify(rpc_error(14, "Server shutdownNow invoked")) == :terminal
-    end
-
-    test "UNAVAILABLE (14) with message containing shutdown string is terminal" do
-      assert ErrorClassifier.classify(rpc_error(14, "prefix Server shutdownNow invoked suffix")) ==
-               :terminal
     end
   end
 

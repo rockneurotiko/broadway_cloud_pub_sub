@@ -5,16 +5,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   # Responsibilities:
   #   - Connect and reconnect with exponential backoff
   #   - Receive messages from the stream and forward them to the producer
-  #   - Accept ack/modifyAckDeadline requests from StreamingAcknowledger and
-  #     send them on the stream
+  #   - Route ack/modifyAckDeadline requests to AckBatcher, which sends them
+  #     as unary RPCs via UnaryRpcClient (independent of this stream)
   #   - Track outstanding (delivered but not acked) message ack_ids for
   #     lease management and shutdown nacking
-  #   - Extend message leases periodically via modifyAckDeadline
-  #   - Buffer ack/nack requests during reconnection and replay on connect
+  #   - Extend message leases periodically via modifyAckDeadline (through AckBatcher)
   #   - Buffer incoming messages when the producer has no pending demand
   #     (demand-based backpressure via notify_demand/1)
   #   - Send keep-alive pings every 30s to prevent server idle timeout
-  #     (matches the Go pingTicker and Python Heartbeater behaviour)
   #
   # Backpressure design:
   #   The producer calls notify_demand/2 whenever Broadway signals new demand,
@@ -30,46 +28,51 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   #   A dedicated `StreamReader` process owns the gRPC stream for both the
   #   Gun and Mint adapters. The reader calls `GRPC.Stub.recv/2` and forwards
   #   decoded messages back as `{:stream_messages, msgs}`. See `StreamReader`
-  #   for a detailed explanation of why a separate process is needed and how
-  #   both adapters behave identically from this module's perspective.
+  #   for a detailed explanation of why a separate process is needed.
   #
   # Keep-alive pings:
   #   Google's servers close idle StreamingPull connections after ~60 seconds
-  #   of inactivity. Both the official Go (pingTicker) and Python (Heartbeater)
-  #   libraries send an empty StreamingPullRequest every 30 seconds to prevent
-  #   this. We do the same via the :send_keepalive timer. The timer is started
-  #   when the stream opens and cancelled when it closes.
+  #   of inactivity. We send an empty StreamingPullRequest every 30 seconds to
+  #   prevent this via the :send_keepalive timer.
   #
   # Reconnect deduplication:
   #   Multiple events can arrive close together on a disconnect — e.g.
   #   {:stream_error} followed by {:stream_closed} or an {:EXIT} signal.
-  #   Without deduplication, each would schedule a separate :connect message,
-  #   causing two concurrent connection attempts. We track the pending reconnect
-  #   timer ref in `reconnect_ref` and skip scheduling if one is already set.
+  #   We track the pending reconnect timer ref in `reconnect_ref` and skip
+  #   scheduling if one is already set.
   #
   # Error classification:
   #   gRPC errors are classified as :retryable (reconnect) or :terminal (stop).
   #   Terminal errors (NOT_FOUND, PERMISSION_DENIED, etc.) indicate a permanent
-  #   misconfiguration; retrying forever would be counterproductive. The GenServer
-  #   stops with {:terminal_error, reason} and Broadway's supervision restarts it,
-  #   which will surface the error via normal OTP crash reporting.
-  #
-  # Skip-backoff optimisation:
-  #   If a stream error arrives quickly after the stream opened, we apply the
-  #   full exponential backoff. If the stream was alive for >30s before failing
-  #   (meaning the server already had time to send a DEADLINE_EXCEEDED), we skip
-  #   the backoff sleep and reconnect immediately — matching the Go optimisation.
+  #   misconfiguration. The GenServer stops and Broadway's supervision restarts it.
 
   use GenServer
   require Logger
 
   alias BroadwayCloudPubSub.{Backoff, MessageBuilder}
-  alias BroadwayCloudPubSub.Streaming.{ErrorClassifier, StreamReader}
+
+  alias BroadwayCloudPubSub.Streaming.{
+    AckBatcher,
+    AckTimeDistribution,
+    ErrorClassifier,
+    StreamReader
+  }
+
   alias Google.Pubsub.V1.StreamingPullRequest
 
-  # Default keep-alive interval — matches Go's pingTicker and Python's Heartbeater.
-  # The server's inactivity timeout is ~60s; pinging at half that prevents closure.
+  # Default keep-alive interval. The server's inactivity timeout is ~60s;
+  # pinging at half that prevents closure.
   @default_keepalive_ms 30_000
+
+  @default_drain_timeout_ms 30_000
+
+  # Grace period (seconds) subtracted from the adaptive deadline to compute the
+  # lease extension interval. Ensures the modack reaches the server before the
+  # current deadline expires.
+  @grace_period_seconds 5
+
+  # Minimum ack deadline for exactly-once delivery mode.
+  @min_deadline_exactly_once_seconds 60
 
   defstruct [
     :producer_pid,
@@ -81,29 +84,46 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     :reader_pid,
     :backoff,
     :lease_timer,
-    :lease_extension_interval_ms,
+    # Distribution for tracking message processing times, used to compute the
+    # adaptive p99 ack deadline.
+    :ack_time_dist,
     :receiving,
     # Timer ref for the pending :connect message. Non-nil means a reconnect is
     # already scheduled — prevents double-scheduling from multiple close signals.
     :reconnect_ref,
     # Timer ref for the periodic :send_keepalive message.
     :keepalive_timer,
-    # Monotonic timestamp (ms) of when the current stream was opened.
-    # Used for the skip-backoff optimisation: if the stream ran >30s before
-    # failing, we skip the backoff sleep and reconnect immediately.
-    :stream_opened_at,
-    outstanding: MapSet.new(),
+    # Registered name of the AckBatcher (not PID) so we survive UnaryAckSupervisor
+    # restarts within a supervision cycle.
+    :ack_batcher,
+    # Whether the producer has asked us to stop (prepare_for_draining called).
+    # When true, new incoming messages from the stream are ignored and we close
+    # the reader immediately.
+    draining: false,
+    # Timer ref for the drain timeout. Non-nil means we are waiting for in-flight
+    # messages to be acked before closing the stream.
+    drain_timer: nil,
+    # Whether the subscription has message ordering enabled, as reported by the
+    # server in StreamingPullResponse.subscription_properties.
+    # Updated dynamically on each response that includes subscription_properties.
+    ordering_enabled: false,
+    # Whether the subscription has exactly-once delivery enabled, as reported by the
+    # server in StreamingPullResponse.subscription_properties.
+    # When true, the minimum ack deadline extension is raised from 10s to 60s.
+    # Updated dynamically on each response that includes subscription_properties.
+    exactly_once_enabled: false,
+    # Map of ack_id => %{received_at: monotonic_ms, max_expiry: monotonic_ms}
+    # for outstanding (delivered but not yet acked) messages.
+    # received_at is used to compute processing duration for the adaptive p99 deadline.
+    # max_expiry marks the absolute wall time beyond which we stop extending the lease.
+    outstanding: %{},
     # Messages buffered while the producer has no pending demand.
+    # Stored as an Erlang :queue for O(1) enqueue and O(1) dequeue.
     # Naturally bounded by max_outstanding_messages (server-side flow control).
-    message_buffer: [],
+    message_buffer: :queue.new(),
     # How many messages the producer can currently accept.
     # Refreshed on each notify_demand/2; decremented when messages are flushed.
-    pending_demand: 0,
-    # Ack/nack requests buffered while the gRPC stream is down (reconnecting).
-    # Replayed in FIFO order on successful reconnect. Naturally bounded by
-    # max_outstanding_messages — no more acks can arrive than messages delivered.
-    ack_buffer: [],
-    ack_buffer_size: 0
+    pending_demand: 0
   ]
 
   # --- Public API ---
@@ -174,6 +194,19 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   @doc """
+  Returns the ack_ids of messages that are buffered in StreamManager but have
+  not yet been dispatched to Broadway processors. These are messages received
+  from the gRPC stream that are waiting for demand.
+
+  Called from the producer's `prepare_for_draining/1` to nack buffered messages
+  during graceful shutdown before they are delivered to the pipeline.
+  """
+  @spec get_buffered(pid()) :: [String.t()]
+  def get_buffered(pid) do
+    GenServer.call(pid, :get_buffered)
+  end
+
+  @doc """
   Signals the current demand from the producer. The `amount` is the producer's
   total accumulated demand (not a delta). The StreamManager uses it as an upper
   bound for how many buffered messages to flush immediately.
@@ -199,15 +232,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         max: config.backoff_max
       )
 
-    deadline_s = config.stream_ack_deadline_seconds
-    extension_percent = config.lease_extension_percent
-    lease_extension_interval_ms = round(deadline_s * extension_percent * 1000)
+    ack_batcher = Module.concat(config.broadway_name, AckBatcher)
 
     state = %__MODULE__{
       producer_pid: nil,
       config: config,
       backoff: backoff,
-      lease_extension_interval_ms: lease_extension_interval_ms,
+      ack_time_dist: AckTimeDistribution.new(config.stream_ack_deadline_seconds),
+      ack_batcher: ack_batcher,
       receiving: true,
       pending_demand: 0
     }
@@ -218,7 +250,6 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   @impl GenServer
   def handle_info(:connect, state) do
-    # Clear the reconnect_ref — we are now executing the scheduled connect.
     state = %{state | reconnect_ref: nil}
 
     case connect(state) do
@@ -237,24 +268,17 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     conn_pid = grpc_stream.channel.adapter_payload.conn_pid
     backoff = Backoff.reset(state.backoff)
 
-    pre_flush_state = %{
+    state = %{
       state
       | grpc_stream: grpc_stream,
         conn_pid: conn_pid,
-        backoff: backoff,
-        stream_opened_at: now_ms()
+        backoff: backoff
     }
 
-    case flush_ack_buffer(pre_flush_state) do
-      {:ok, state} ->
-        state = schedule_lease_timer(state)
-        state = schedule_keepalive_timer(state)
-        emit_telemetry(:connect, %{}, state.config)
-        {:noreply, state}
-
-      {:error, reason, state} ->
-        {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
-    end
+    state = schedule_lease_timer(state)
+    state = schedule_keepalive_timer(state)
+    emit_telemetry(:connect, %{}, state.config)
+    {:noreply, state}
   end
 
   # Stale :stream_opened from a previous reader (race during reconnect) — ignore.
@@ -267,12 +291,43 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     if state.receiving and messages != [] do
       broadway_messages = Enum.map(messages, &build_broadway_message(&1, state))
       ack_ids = Enum.map(messages, & &1.ack_id)
-      new_outstanding = Enum.reduce(ack_ids, state.outstanding, &MapSet.put(&2, &1))
+
+      now = now_ms()
+      max_extension_ms = state.config.max_extension_ms
+
+      new_outstanding =
+        Enum.reduce(ack_ids, state.outstanding, fn ack_id, acc ->
+          Map.put(acc, ack_id, %{received_at: now, max_expiry: now + max_extension_ms})
+        end)
+
+      # Receipt modack: immediately extend the ack deadline with the current adaptive
+      # p99 value. This synchronises the server-side timer with the client-side timer,
+      # compensating for network latency between when the server sent the message and
+      # when we received it. Matches Go's receiptTicker and Python's receipt modack.
+      # Sent as a unary RPC via AckBatcher — independent of the bidi stream.
+      adaptive_deadline = AckTimeDistribution.percentile(state.ack_time_dist, 0.99)
+      AckBatcher.modack(state.ack_batcher, ack_ids, adaptive_deadline)
+
       emit_telemetry(:receive_messages, %{count: length(broadway_messages)}, state.config)
       {:noreply, deliver_messages(%{state | outstanding: new_outstanding}, broadway_messages)}
     else
       {:noreply, state}
     end
+  end
+
+  # Subscription properties update forwarded from the StreamReader.
+  # The server sends these in StreamingPullResponse.subscription_properties on
+  # any response (including heartbeats) when the subscription's settings change.
+  def handle_info(
+        {:subscription_properties,
+         %{
+           message_ordering_enabled: ordering_enabled,
+           exactly_once_delivery_enabled: exactly_once_enabled
+         } = _props},
+        state
+      ) do
+    {:noreply,
+     %{state | ordering_enabled: ordering_enabled, exactly_once_enabled: exactly_once_enabled}}
   end
 
   # Stream-level gRPC error reported by the StreamReader.
@@ -323,43 +378,60 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   def handle_info(:extend_leases, state) do
-    if MapSet.size(state.outstanding) == 0 or state.grpc_stream == nil do
-      timer = Process.send_after(self(), :extend_leases, state.lease_extension_interval_ms)
-      {:noreply, %{state | lease_timer: timer}}
-    else
-      ack_ids = MapSet.to_list(state.outstanding)
-      deadline = state.config.stream_ack_deadline_seconds
-      deadlines = List.duplicate(deadline, length(ack_ids))
+    now = now_ms()
+    adaptive_deadline = AckTimeDistribution.percentile(state.ack_time_dist, 0.99)
 
-      case send_on_stream(state.grpc_stream, %StreamingPullRequest{
-             modify_deadline_ack_ids: ack_ids,
-             modify_deadline_seconds: deadlines
-           }) do
-        :ok ->
-          timer = Process.send_after(self(), :extend_leases, state.lease_extension_interval_ms)
-          {:noreply, %{state | lease_timer: timer}}
-
-        {:error, reason} ->
-          {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
+    # When exactly-once delivery is enabled, enforce a higher minimum deadline of 60s.
+    effective_deadline =
+      if state.exactly_once_enabled do
+        max(adaptive_deadline, @min_deadline_exactly_once_seconds)
+      else
+        adaptive_deadline
       end
+
+    # Partition into still-valid (before max_expiry) and expired (past max_expiry).
+    # Expired messages are dropped from lease management — the server will redeliver them.
+    {valid, expired} =
+      Map.split_with(state.outstanding, fn {_id, info} -> info.max_expiry > now end)
+
+    if map_size(expired) > 0 do
+      emit_telemetry(:lease_expired, %{count: map_size(expired)}, state.config)
     end
+
+    emit_telemetry(
+      :extend_leases,
+      %{count: map_size(valid), deadline: effective_deadline},
+      state.config
+    )
+
+    if map_size(valid) > 0 do
+      AckBatcher.modack(state.ack_batcher, Map.keys(valid), effective_deadline)
+    end
+
+    # Schedule next tick: (effective_deadline - grace_period) with jitter, minimum 1s.
+    # Jitter factor in [0.8, 0.9) prevents all StreamManagers from extending in lockstep.
+    base_interval_ms = max(1_000, (effective_deadline - @grace_period_seconds) * 1_000)
+    jitter_factor = 0.8 + :rand.uniform() * 0.1
+    next_interval_ms = round(base_interval_ms * jitter_factor)
+    timer = Process.send_after(self(), :extend_leases, next_interval_ms)
+    {:noreply, %{state | outstanding: valid, lease_timer: timer}}
   end
 
   # Periodic keep-alive ping: send an empty StreamingPullRequest to prevent the
-  # server from closing an idle stream. Matches Go's pingTicker (30s) and Python's
-  # Heartbeater (30s). The server's inactivity timeout is ~60s; pinging at half
-  # that gives a comfortable margin.
+  # server from closing an idle stream. The server's inactivity timeout is ~60s.
   def handle_info(:send_keepalive, %{grpc_stream: nil} = state) do
-    # Stream is disconnected — don't ping, but reschedule for when it reconnects.
-    # (Timer will be cancelled and restarted by close_stream/schedule_keepalive_timer.)
     {:noreply, state}
   end
 
   def handle_info(:send_keepalive, state) do
-    case send_on_stream(state.grpc_stream, %StreamingPullRequest{}) do
-      :ok ->
+    adaptive_deadline = AckTimeDistribution.percentile(state.ack_time_dist, 0.99)
+    keepalive_request = %StreamingPullRequest{stream_ack_deadline_seconds: adaptive_deadline}
+
+    case send_on_stream(state.grpc_stream, keepalive_request) do
+      {:ok, stream} ->
+        emit_telemetry(:keepalive, %{deadline: adaptive_deadline}, state.config)
         timer = schedule_keepalive_after(state.config)
-        {:noreply, %{state | keepalive_timer: timer}}
+        {:noreply, %{state | grpc_stream: stream, keepalive_timer: timer}}
 
       {:error, reason} ->
         {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
@@ -367,15 +439,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   # Mint adapter signals connection loss to its parent process.
-  # When the test (or the real stack) routes this signal to StreamManager,
-  # treat it the same as a stream error: reset and reconnect.
   def handle_info({:elixir_grpc, :connection_down, conn_pid}, %{conn_pid: conn_pid} = state) do
     emit_telemetry(:disconnect, %{reason: :connection_down}, state.config)
     {:noreply, schedule_reconnect(reset_connection(state, :connection_down))}
   end
 
   # Gun adapter signals connection loss via :gun_down messages.
-  # Guard on the stored conn_pid to ignore stale/other connections.
   def handle_info(
         {:gun_down, conn_pid, _protocol, _reason, _killed_streams},
         %{conn_pid: conn_pid} = state
@@ -384,62 +453,77 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     {:noreply, schedule_reconnect(reset_connection(state, :connection_down))}
   end
 
+  def handle_info(:drain_timeout, state) do
+    emit_telemetry(:drain_timeout, %{}, state.config)
+    state = close_stream(%{state | drain_timer: nil})
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state) do
     {:noreply, state}
   end
 
   @impl GenServer
   def handle_cast({:acknowledge, ack_ids}, state) do
-    new_outstanding = Enum.reduce(ack_ids, state.outstanding, &MapSet.delete(&2, &1))
-    state = %{state | outstanding: new_outstanding}
+    now = now_ms()
 
-    if state.grpc_stream do
-      case send_on_stream(state.grpc_stream, %StreamingPullRequest{ack_ids: ack_ids}) do
-        :ok ->
-          emit_telemetry(:ack, %{count: length(ack_ids)}, state.config)
-          {:noreply, state}
+    # Record processing times for the adaptive p99 deadline calculation.
+    ack_time_dist =
+      Enum.reduce(ack_ids, state.ack_time_dist, fn ack_id, dist ->
+        case Map.get(state.outstanding, ack_id) do
+          %{received_at: received_at} ->
+            duration_s = max(1, div(now - received_at, 1_000))
+            AckTimeDistribution.record(dist, duration_s)
 
-        {:error, reason} ->
-          {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
-      end
-    else
-      {:noreply, buffer_ack_request(state, {:ack, ack_ids})}
-    end
+          nil ->
+            dist
+        end
+      end)
+
+    new_outstanding = Enum.reduce(ack_ids, state.outstanding, &Map.delete(&2, &1))
+    state = %{state | outstanding: new_outstanding, ack_time_dist: ack_time_dist}
+
+    AckBatcher.ack(state.ack_batcher, ack_ids)
+    emit_telemetry(:ack, %{count: length(ack_ids)}, state.config)
+
+    {:noreply, maybe_complete_drain(state)}
   end
 
   def handle_cast({:modify_deadline, ack_ids, deadline_seconds}, state) do
-    new_outstanding =
+    now = now_ms()
+
+    # On nack (deadline == 0), record processing times and remove from outstanding
+    # so they are not lease-extended further. On non-zero deadline changes,
+    # keep the ack_ids in outstanding unchanged.
+    {new_outstanding, ack_time_dist} =
       if deadline_seconds == 0 do
-        Enum.reduce(ack_ids, state.outstanding, &MapSet.delete(&2, &1))
+        dist =
+          Enum.reduce(ack_ids, state.ack_time_dist, fn ack_id, acc ->
+            case Map.get(state.outstanding, ack_id) do
+              %{received_at: received_at} ->
+                duration_s = max(1, div(now - received_at, 1_000))
+                AckTimeDistribution.record(acc, duration_s)
+
+              nil ->
+                acc
+            end
+          end)
+
+        outstanding = Enum.reduce(ack_ids, state.outstanding, &Map.delete(&2, &1))
+        {outstanding, dist}
       else
-        state.outstanding
+        {state.outstanding, state.ack_time_dist}
       end
 
-    deadlines = List.duplicate(deadline_seconds, length(ack_ids))
-    state = %{state | outstanding: new_outstanding}
+    state = %{state | outstanding: new_outstanding, ack_time_dist: ack_time_dist}
 
-    if state.grpc_stream do
-      case send_on_stream(state.grpc_stream, %StreamingPullRequest{
-             modify_deadline_ack_ids: ack_ids,
-             modify_deadline_seconds: deadlines
-           }) do
-        :ok ->
-          {:noreply, state}
+    AckBatcher.modack(state.ack_batcher, ack_ids, deadline_seconds)
 
-        {:error, reason} ->
-          {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
-      end
-    else
-      {:noreply, buffer_ack_request(state, {:modify_deadline, ack_ids, deadline_seconds})}
-    end
+    {:noreply, maybe_complete_drain(state)}
   end
 
   # The producer signals its current total demand. Update pending_demand and
   # flush up to that many buffered messages to the producer.
-  def handle_cast({:demand_available, amount}, %{message_buffer: []} = state) do
-    {:noreply, %{state | pending_demand: amount}}
-  end
-
   def handle_cast({:demand_available, amount}, state) do
     state = %{state | pending_demand: amount}
     {:noreply, flush_demand(state)}
@@ -453,21 +537,29 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   def handle_call(:stop_receiving, _from, state) do
-    {:reply, :ok, %{state | receiving: false}}
+    # Close the reader so no new messages arrive; keep the channel open for AckBatcher.
+    state = close_reader(state)
+    state = start_drain_timer(state)
+    {:reply, :ok, %{state | receiving: false, draining: true}}
   end
 
   def handle_call(:get_outstanding, _from, state) do
-    {:reply, MapSet.to_list(state.outstanding), state}
+    {:reply, Map.keys(state.outstanding), state}
+  end
+
+  def handle_call(:get_buffered, _from, state) do
+    ack_ids =
+      state.message_buffer
+      |> :queue.to_list()
+      |> Enum.map(fn %Broadway.Message{acknowledger: {_, _, %{ack_id: id}}} -> id end)
+
+    {:reply, ack_ids, state}
   end
 
   def handle_call(:close, _from, state) do
-    # Best-effort: flush buffered acks before closing. Errors are ignored
-    # because we're shutting down regardless.
-    state =
-      case flush_ack_buffer(state) do
-        {:ok, s} -> s
-        {:error, _reason, s} -> %{s | ack_buffer: [], ack_buffer_size: 0}
-      end
+    # Best-effort flush before closing. Guard against AckBatcher already being
+    # dead during pipeline shutdown (Broadway stops children in reverse start order).
+    flush_batcher_if_alive(state.ack_batcher)
 
     state = close_stream(state)
     {:reply, :ok, state}
@@ -475,9 +567,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   @impl GenServer
   def terminate(_reason, state) do
-    cancel_lease_timer(state)
-    cancel_keepalive_timer(state)
-    close_stream(state)
+    state
+    |> cancel_lease_timer()
+    |> cancel_keepalive_timer()
+    |> cancel_drain_timer()
+    |> close_stream()
+
     :ok
   end
 
@@ -495,18 +590,17 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   # Opens the gRPC channel and spawns the StreamReader, which will open the
   # stream and send {:stream_opened, reader_pid, grpc_stream} back to us.
-  # The actual grpc_stream struct is stored on {:stream_opened} receipt, not here.
   defp connect_stream(channel, state) do
-    reader_pid = StreamReader.start_link(self(), channel, state.config)
-
-    {:ok,
-     %{
-       state
-       | channel: channel,
-         reader_pid: reader_pid,
-         grpc_stream: nil,
-         conn_pid: nil
-     }}
+    with {:ok, reader_pid} <- StreamReader.start_link(self(), channel, state.config) do
+      {:ok,
+       %{
+         state
+         | channel: channel,
+           reader_pid: reader_pid,
+           grpc_stream: nil,
+           conn_pid: nil
+       }}
+    end
   rescue
     e ->
       try do
@@ -551,39 +645,35 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   defp send_on_stream(grpc_stream, request) do
-    GRPC.Stub.send_request(grpc_stream, request)
-    :ok
+    case GRPC.Stub.send_request(grpc_stream, request) do
+      %GRPC.Client.Stream{} = stream -> {:ok, stream}
+      {:error, reason} -> {:error, reason}
+    end
   catch
     kind, reason -> {:error, {kind, reason}}
   end
 
   defp reset_connection(state, reason) do
-    # Drop buffered (not-yet-delivered) messages on disconnect. Their ack_ids are
-    # in `outstanding`, so extract and remove them before closing the stream to
-    # avoid pointless lease-extension attempts for messages that will be redelivered.
+    # Drop buffered (not-yet-delivered) messages on disconnect — their ack_ids
+    # are in `outstanding`, so remove them to avoid pointless lease-extension
+    # attempts for messages that will be redelivered.
     buffered_ack_ids =
       state.message_buffer
+      |> :queue.to_list()
       |> Enum.map(fn %Broadway.Message{acknowledger: {_, _, %{ack_id: id}}} -> id end)
 
     new_outstanding =
-      Enum.reduce(buffered_ack_ids, state.outstanding, &MapSet.delete(&2, &1))
+      Enum.reduce(buffered_ack_ids, state.outstanding, &Map.delete(&2, &1))
 
     # Preserve `pending_demand` across reconnection. The producer's demand counter
     # survives the disconnect and it won't re-signal demand it already sent.
-    # Clearing pending_demand here would cause a demand deadlock: the producer has
-    # pending demand but thinks it already notified us, while we lost the count.
-    # Buffered messages are dropped (the server will redeliver them), but demand
-    # state must carry over so the reconnected stream can deliver immediately.
-    #
-    # Record the disconnect reason so schedule_reconnect can apply the skip-backoff
-    # optimisation: if the stream was alive for >30s, reconnect without delay.
+    # Clearing it would cause a demand deadlock: the producer has pending demand
+    # but thinks it already notified us, while we lost the count.
     close_stream(
       %{
         state
-        | message_buffer: [],
+        | message_buffer: :queue.new(),
           outstanding: new_outstanding,
-          stream_opened_at: state.stream_opened_at,
-          # carry stream_opened_at through for the skip-backoff check
           reconnect_ref: state.reconnect_ref
       },
       reason
@@ -594,7 +684,6 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   defp close_stream(%{reader_pid: nil, grpc_stream: nil} = state), do: state
 
   defp close_stream(%{reader_pid: reader_pid, grpc_stream: grpc_stream, channel: channel} = state) do
-    # Stop the reader first so it doesn't send more messages while we clean up.
     # Unlink before killing to prevent the EXIT signal from triggering reconnect.
     if is_pid(reader_pid) do
       Process.unlink(reader_pid)
@@ -612,8 +701,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     if channel do
       # Only call disconnect if the underlying connection process is alive.
       # When the server closes the channel (e.g. after DEADLINE_EXCEEDED), the
-      # adapter's connection process may already be gone. Calling disconnect on a
-      # dead channel causes a FunctionClauseError inside grpc's GenServer.
+      # adapter's connection process may already be gone. Calling disconnect on
+      # a dead channel causes a FunctionClauseError inside grpc's GenServer.
       conn_alive? =
         case state.conn_pid do
           pid when is_pid(pid) -> Process.alive?(pid)
@@ -631,12 +720,9 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
     # Cancel the keep-alive timer — it will be restarted when the new stream opens.
     state = cancel_keepalive_timer(state)
-
     %{state | reader_pid: nil, grpc_stream: nil, channel: nil, conn_pid: nil}
   end
 
-  # close_stream with a reason — delegates to the main close_stream but also
-  # stores the reason for the skip-backoff optimisation in schedule_reconnect.
   defp close_stream(state, _reason) do
     close_stream(state)
   end
@@ -647,38 +733,18 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     raise "StreamManager failed to connect and backoff is :stop — crashing"
   end
 
-  # Deduplication: if a :connect message is already pending, do not schedule
-  # another one. This prevents the double-reconnect race where {:stream_error}
-  # and {:stream_closed} (or {:EXIT}) both arrive within a single disconnect.
+  # Deduplication: if a :connect is already pending, skip to prevent the
+  # double-reconnect race where {:stream_error} and {:stream_closed} (or {:EXIT})
+  # both arrive within a single disconnect.
   defp schedule_reconnect(%{reconnect_ref: ref} = state) when not is_nil(ref) do
     state
   end
 
-  defp schedule_reconnect(%{backoff: backoff, stream_opened_at: opened_at} = state) do
+  defp schedule_reconnect(%{backoff: backoff} = state) do
     {timeout, new_backoff} = Backoff.backoff(backoff)
-
-    # Skip-backoff optimisation (matches Go's behaviour):
-    # If the stream was alive for more than 30 seconds before failing, the server
-    # had time to process a DEADLINE_EXCEEDED (or similar timeout). Adding a
-    # backoff delay on top of the already-long blocking period compounds the
-    # reconnect latency unnecessarily. Reconnect immediately instead.
-    effective_timeout =
-      if skip_backoff?(opened_at) do
-        0
-      else
-        timeout
-      end
-
-    ref = Process.send_after(self(), :connect, effective_timeout)
+    emit_telemetry(:reconnect, %{delay: timeout}, state.config)
+    ref = Process.send_after(self(), :connect, timeout)
     %{state | backoff: new_backoff, reconnect_ref: ref}
-  end
-
-  # Returns true if the stream was open long enough that we should skip the
-  # exponential backoff sleep. Threshold: 30 seconds (same as Go).
-  defp skip_backoff?(nil), do: false
-
-  defp skip_backoff?(opened_at) do
-    now_ms() - opened_at >= 30_000
   end
 
   defp now_ms, do: System.monotonic_time(:millisecond)
@@ -687,7 +753,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   defp schedule_lease_timer(state) do
     cancel_lease_timer(state)
-    timer = Process.send_after(self(), :extend_leases, state.lease_extension_interval_ms)
+    # Initial interval: (configured deadline - grace period) with jitter, minimum 1s.
+    deadline_s = state.config.stream_ack_deadline_seconds
+    base_ms = max(1_000, (deadline_s - @grace_period_seconds) * 1_000)
+    jitter_factor = 0.8 + :rand.uniform() * 0.1
+    interval_ms = round(base_ms * jitter_factor)
+    timer = Process.send_after(self(), :extend_leases, interval_ms)
     %{state | lease_timer: timer}
   end
 
@@ -718,80 +789,83 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     %{state | keepalive_timer: nil}
   end
 
-  # --- Private: ack buffering ---
+  # --- Private: drain ---
 
-  defp buffer_ack_request(%{ack_buffer: buffer, ack_buffer_size: size} = state, request) do
-    emit_telemetry(:ack_buffered, %{buffer_size: size + 1}, state.config)
-    %{state | ack_buffer: [request | buffer], ack_buffer_size: size + 1}
+  # Kill the reader so no new messages arrive from the gRPC stream.
+  # The channel stays open for AckBatcher's unary ack/modack RPCs.
+  defp close_reader(%{reader_pid: nil} = state), do: state
+
+  defp close_reader(%{reader_pid: reader_pid} = state) do
+    Process.unlink(reader_pid)
+    Process.exit(reader_pid, :kill)
+    %{state | reader_pid: nil}
   end
 
-  defp flush_ack_buffer(%{ack_buffer: [], grpc_stream: _} = state), do: {:ok, state}
-
-  defp flush_ack_buffer(%{ack_buffer: _buffer, grpc_stream: nil} = state), do: {:ok, state}
-
-  defp flush_ack_buffer(%{ack_buffer: buffer, grpc_stream: grpc_stream} = state) do
-    result =
-      buffer
-      |> Enum.reverse()
-      |> Enum.reduce_while(:ok, fn entry, :ok ->
-        request =
-          case entry do
-            {:ack, ack_ids} ->
-              %StreamingPullRequest{ack_ids: ack_ids}
-
-            {:modify_deadline, ack_ids, deadline_seconds} ->
-              deadlines = List.duplicate(deadline_seconds, length(ack_ids))
-
-              %StreamingPullRequest{
-                modify_deadline_ack_ids: ack_ids,
-                modify_deadline_seconds: deadlines
-              }
-          end
-
-        case send_on_stream(grpc_stream, request) do
-          :ok -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
-
-    case result do
-      :ok -> {:ok, %{state | ack_buffer: [], ack_buffer_size: 0}}
-      {:error, reason} -> {:error, reason, state}
-    end
+  defp start_drain_timer(state) do
+    timeout = Map.get(state.config, :drain_timeout_ms, @default_drain_timeout_ms)
+    timer = Process.send_after(self(), :drain_timeout, timeout)
+    %{state | drain_timer: timer}
   end
+
+  defp cancel_drain_timer(%{drain_timer: nil} = state), do: state
+
+  defp cancel_drain_timer(%{drain_timer: timer} = state) do
+    Process.cancel_timer(timer)
+    %{state | drain_timer: nil}
+  end
+
+  # After each ack/nack, check if we are draining and all outstanding messages
+  # have been resolved. If so, cancel the drain timer and close the stream.
+  defp maybe_complete_drain(%{draining: true, outstanding: outstanding} = state)
+       when map_size(outstanding) == 0 do
+    state = cancel_drain_timer(state)
+
+    # Guard against AckBatcher already being dead during pipeline shutdown.
+    flush_batcher_if_alive(state.ack_batcher)
+
+    emit_telemetry(:drain_complete, %{}, state.config)
+    close_stream(state)
+  end
+
+  defp maybe_complete_drain(state), do: state
 
   # --- Private: message building ---
 
   # Buffer incoming messages, then flush up to pending_demand to the producer.
-  # Returns updated state.
   defp deliver_messages(state, messages) do
-    # Prepend for O(1); reversed on flush.
-    new_buffer = Enum.reduce(messages, state.message_buffer, fn msg, acc -> [msg | acc] end)
+    new_buffer = Enum.reduce(messages, state.message_buffer, &:queue.in(&1, &2))
     flush_demand(%{state | message_buffer: new_buffer})
   end
 
   # Flush up to `pending_demand` messages from the buffer to the producer.
-  # If the buffer is empty or pending_demand is 0, this is a no-op.
   defp flush_demand(%{pending_demand: 0} = state), do: state
-  defp flush_demand(%{message_buffer: []} = state), do: state
 
   defp flush_demand(state) do
-    all_messages = Enum.reverse(state.message_buffer)
-    to_send = min(state.pending_demand, length(all_messages))
-    {batch, rest} = Enum.split(all_messages, to_send)
+    if :queue.is_empty(state.message_buffer) do
+      state
+    else
+      {remaining, demand_left, batch_reversed} =
+        flush_demand_loop(state.message_buffer, state.pending_demand, [])
 
-    send(state.producer_pid, {:stream_messages, batch})
+      send(state.producer_pid, {:stream_messages, Enum.reverse(batch_reversed)})
+      %{state | message_buffer: remaining, pending_demand: demand_left}
+    end
+  end
 
-    # Store remainder back in reversed (prepend-friendly) order
-    reversed_rest = Enum.reverse(rest)
-    %{state | message_buffer: reversed_rest, pending_demand: state.pending_demand - to_send}
+  defp flush_demand_loop(queue, 0, acc), do: {queue, 0, acc}
+
+  defp flush_demand_loop(queue, n, acc) do
+    case :queue.out(queue) do
+      {{:value, msg}, rest} -> flush_demand_loop(rest, n - 1, [msg | acc])
+      {:empty, _} -> {queue, n, acc}
+    end
   end
 
   defp build_broadway_message(
          %{ack_id: ack_id, message: pubsub_msg, delivery_attempt: delivery_attempt},
          state
        ) do
-    # ack_ref is the Broadway pipeline name — the key used in :persistent_term by the producer
+    # ack_ref is the Broadway pipeline name, used as the persistent_term key.
     ack_ref = state.config.broadway[:name]
     acknowledger = BroadwayCloudPubSub.Streaming.Acknowledger.builder(ack_ref).(ack_id)
 
@@ -827,6 +901,18 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   defp fetch_token(%{token_generator: {mod, fun, args}}) do
     apply(mod, fun, args)
+  end
+
+  # Flush AckBatcher if its process is currently alive. Guards against the
+  # batcher being down during pipeline shutdown (Broadway stops children in
+  # reverse start order).
+  defp flush_batcher_if_alive(nil), do: :ok
+
+  defp flush_batcher_if_alive(batcher) do
+    case GenServer.whereis(batcher) do
+      nil -> :ok
+      pid -> AckBatcher.flush(pid)
+    end
   end
 
   # --- Private: telemetry ---

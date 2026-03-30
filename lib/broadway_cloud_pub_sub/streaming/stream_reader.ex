@@ -11,33 +11,6 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
   # calls, and timers). By spawning a dedicated reader process, the GenServer
   # remains fully responsive while streaming runs concurrently.
   #
-  # ## Unified adapter abstraction
-  #
-  # This module uses only the public `GRPC.Stub` API:
-  #
-  #   1. `Stub.streaming_pull(channel)` — opens the bidirectional stream
-  #   2. `GRPC.Stub.send_request(stream, initial_request)` — sends the initial
-  #      StreamingPullRequest (subscription name, flow control settings, etc.)
-  #   3. `GRPC.Stub.recv(stream)` — returns an `{:ok, Enumerable.t()}` of
-  #      decoded `{:ok, StreamingPullResponse.t()}` items
-  #
-  # Both the Gun and Mint adapters implement this interface identically from the
-  # caller's perspective:
-  #
-  #   - **Gun**: `:gun.post` is called from this process, so Gun sends all
-  #     `{:gun_response, :gun_data, ...}` messages to this process's mailbox.
-  #     `GRPC.Stub.recv` returns a `Stream.unfold/2` backed by `:gun.await/3`,
-  #     which is a selective receive that processes those mailbox messages.
-  #
-  #   - **Mint**: `GRPC.Client.Adapters.Mint.ConnectionProcess` owns the TCP
-  #     connection. A `StreamResponseProcess` is started per stream. Decoded
-  #     messages are enqueued there and served to the caller via
-  #     `GenServer.call(:get_response, :infinity)`.
-  #
-  # In both cases the library handles gRPC frame decoding (5-byte
-  # length-prefixed framing + codec decode) and delivers decoded protobuf
-  # structs to the caller.
-  #
   # ## Message protocol with StreamManager
   #
   # After the stream is opened, this process sends the grpc_stream back:
@@ -57,15 +30,9 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
   #
   # After receiving `{:stream_opened, _pid, grpc_stream}`, the StreamManager
   # calls `GRPC.Stub.send_request(grpc_stream, request)` directly from the
-  # GenServer process.
-  #
-  # - **Gun**: `:gun.data/4` is a fire-and-forget `gen_statem:cast`. It can be
-  #   called from any process regardless of who opened the stream.
-  # - **Mint**: `ConnectionProcess.stream_request_body/3` is also a GenServer
-  #   cast, callable from any process.
-  #
-  # Both are safe to call from the StreamManager GenServer concurrently with
-  # the reader process enumerating the receive stream.
+  # GenServer process. Both the Gun and Mint adapters implement this as a
+  # fire-and-forget cast, safe to call from any process concurrently with the
+  # reader process enumerating the receive stream.
 
   alias Google.Pubsub.V1.{StreamingPullRequest, StreamingPullResponse}
   alias Google.Pubsub.V1.Subscriber.Stub
@@ -79,7 +46,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
   """
   @spec start_link(pid(), GRPC.Channel.t(), map()) :: pid()
   def start_link(manager, channel, config) do
-    spawn_link(fn -> run(manager, channel, config) end)
+    Task.start_link(fn -> run(manager, channel, config) end)
   end
 
   # --- Private ---
@@ -115,12 +82,18 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
   defp enumerate(enum, manager) do
     enum
     |> Stream.each(fn
-      {:ok, %StreamingPullResponse{received_messages: msgs}} when msgs != [] ->
-        send(manager, {:stream_messages, msgs})
+      {:ok, %StreamingPullResponse{received_messages: msgs, subscription_properties: props}} ->
+        # Forward subscription_properties whenever the server sends them.
+        # The server may send this on any response (including heartbeats) to
+        # signal that the subscription's ordering or exactly-once settings have
+        # changed. StreamManager stores the latest value in state.
+        if props != nil do
+          send(manager, {:subscription_properties, props})
+        end
 
-      {:ok, %StreamingPullResponse{}} ->
-        # Heartbeat / empty response — nothing to forward
-        :ok
+        if msgs != [] do
+          send(manager, {:stream_messages, msgs})
+        end
 
       {:error, error} ->
         send(manager, {:stream_error, error})

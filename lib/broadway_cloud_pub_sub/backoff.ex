@@ -5,8 +5,9 @@ defmodule BroadwayCloudPubSub.Backoff do
   # Supports :rand_exp (randomized exponential), :exp (pure exponential),
   # :rand (pure random), and :stop (no reconnect).
 
-  @default_min 1_000
-  @default_max 30_000
+  # Aligned with Options defaults (backoff_min: 100, backoff_max: 60_000).
+  @default_min 100
+  @default_max 60_000
 
   @type type :: :rand_exp | :exp | :rand | :stop
 
@@ -27,8 +28,8 @@ defmodule BroadwayCloudPubSub.Backoff do
   ## Options
 
     * `:type` - `:rand_exp` (default), `:exp`, `:rand`, or `:stop`
-    * `:min` - minimum backoff in milliseconds (default: 1000)
-    * `:max` - maximum backoff in milliseconds (default: 30000)
+    * `:min` - minimum backoff in milliseconds (default: 100)
+    * `:max` - maximum backoff in milliseconds (default: 60000)
 
   """
   @spec new(keyword()) :: t() | nil
@@ -102,8 +103,10 @@ defmodule BroadwayCloudPubSub.Backoff do
   end
 
   defp rand(min, max, seed) do
-    {value, new_seed} = :rand.uniform_s(max - min, seed)
-    {value + min, new_seed}
+    # :rand.uniform_s(N) returns a value in [1, N], so we use (max - min + 1)
+    # and subtract 1 to get the correct range [min, max].
+    {value, new_seed} = :rand.uniform_s(max - min + 1, seed)
+    {value - 1 + min, new_seed}
   end
 
   defp seed do

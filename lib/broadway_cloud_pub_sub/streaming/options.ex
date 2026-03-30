@@ -7,10 +7,14 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
   @default_max_outstanding_messages 1_000
   @default_max_outstanding_bytes 100 * 1024 * 1024
   @default_stream_ack_deadline_seconds 60
-  @default_lease_extension_percent 0.6
-  @default_backoff_min 1_000
-  @default_backoff_max 30_000
+  # 60 minutes — matches Go's MaxExtension default.
+  @default_max_extension_ms 60 * 60 * 1_000
+  # gax defaults: https://github.com/googleapis/gax-go/blob/main/v2/call_option.go
+  @default_backoff_min 100
+  @default_backoff_max 60_000
   @default_keepalive_interval_ms 30_000
+  @default_ack_batch_interval_ms 100
+  @default_ack_batch_max_size 2_500
 
   definition = [
     # Handled by Broadway.
@@ -54,15 +58,17 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       The producer will extend leases automatically before this deadline.
       """
     ],
-    lease_extension_percent: [
-      type:
-        {:custom, __MODULE__, :type_float_between_0_and_1, [[{:name, :lease_extension_percent}]]},
-      default: @default_lease_extension_percent,
+    max_extension_ms: [
+      type: :pos_integer,
+      default: @default_max_extension_ms,
       doc: """
-      The fraction of `stream_ack_deadline_seconds` at which leases are
-      extended. For example, with a deadline of 60s and a percent of 0.6,
-      leases are extended every 36s. Must be between 0.0 and 1.0 exclusive.
-      Defaults to 0.6.
+      The maximum total time in milliseconds that a message's ack deadline will
+      be extended from the moment of initial receipt. After this duration, the
+      message is dropped from lease management and the server will redeliver it.
+
+      This prevents a stuck consumer from holding messages indefinitely.
+      Matches the Go client's `MaxExtension` default of 60 minutes.
+      Defaults to #{div(@default_max_extension_ms, 60_000)} minutes.
       """
     ],
     client_id: [
@@ -141,12 +147,29 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
     backoff_min: [
       type: :pos_integer,
       default: @default_backoff_min,
-      doc: "Minimum reconnection backoff in milliseconds. Defaults to 1000."
+      doc:
+        "Minimum reconnection backoff in milliseconds. Matches the gax default of 100ms. Defaults to 100."
     ],
     backoff_max: [
       type: :pos_integer,
       default: @default_backoff_max,
-      doc: "Maximum reconnection backoff in milliseconds. Defaults to 30000."
+      doc:
+        "Maximum reconnection backoff in milliseconds. Matches the gax default of 60s. Defaults to 60000."
+    ],
+    retry_deadline_ms: [
+      type: :pos_integer,
+      default: 60_000,
+      doc: """
+      Maximum total time in milliseconds that the unary RPC client (UnaryRpcClient)
+      will spend retrying a single acknowledge or modifyAckDeadline request before
+      giving up and dropping the ack_ids.
+
+      Each retry attempt uses jittered exponential backoff starting at 100ms and
+      capped at 60s. The default of 60,000ms (60 seconds) matches standard gax
+      retry behaviour. When exactly-once delivery is enabled (auto-detected from
+      subscription properties), this value should be increased to 600,000ms (600
+      seconds) to match the Go client's extended retry deadline for exactly-once acks.
+      """
     ],
     keepalive_interval_ms: [
       type: :pos_integer,
@@ -158,6 +181,30 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       default). Matches the 30-second keepalive interval used by the official
       Python and Go Pub/Sub client libraries. Only applies to the `:gun` adapter.
       Defaults to 30000.
+      """
+    ],
+    ack_batch_interval_ms: [
+      type:
+        {:custom, __MODULE__, :type_integer_in_range,
+         [[{:name, :ack_batch_interval_ms}, {:min, 10}, {:max, 5_000}]]},
+      default: @default_ack_batch_interval_ms,
+      doc: """
+      Interval in milliseconds at which batched ack and modifyAckDeadline
+      requests are flushed to the Pub/Sub service via unary RPCs.
+      Lower values reduce end-to-end ack latency; higher values improve
+      batching efficiency. Defaults to 100.
+      """
+    ],
+    ack_batch_max_size: [
+      type:
+        {:custom, __MODULE__, :type_integer_in_range,
+         [[{:name, :ack_batch_max_size}, {:min, 1}, {:max, 10_000}]]},
+      default: @default_ack_batch_max_size,
+      doc: """
+      Maximum number of ack_ids to accumulate before triggering an
+      immediate flush, regardless of the timer. Each unary RPC carries
+      at most 2,500 ack_ids (the Google API limit), so values above 2,500
+      result in multiple RPCs per flush. Defaults to 2500.
       """
     ],
     adapter: [
@@ -190,6 +237,43 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       Whether to use TLS when connecting to the gRPC endpoint. Set to `false`
       when connecting to the Pub/Sub emulator, which does not use TLS.
       Defaults to `true`.
+      """
+    ],
+    drain_timeout_ms: [
+      type: :pos_integer,
+      default: 30_000,
+      doc: """
+      Maximum time in milliseconds to wait for in-flight messages to be
+      processed and acknowledged during graceful shutdown. After this timeout,
+      any remaining outstanding messages are nacked (per the `on_shutdown`
+      setting) and the connection is force-closed.
+
+      This drain phase mirrors Go's `iterator.stop()` which waits for the
+      `drained` channel to close (all outstanding messages acked) before
+      calling `CloseSend`. Defaults to 30 seconds.
+      """
+    ],
+    enable_message_ordering: [
+      type: :boolean,
+      default: false,
+      doc: """
+      When `true`, messages with the same `ordering_key` are routed to the
+      same Broadway processor and processed sequentially. This guarantees
+      in-order delivery for ordered subscriptions.
+
+      Ordering is enforced via Broadway's built-in `:partition_by` option,
+      which assigns messages with the same `orderingKey` metadata to the
+      same processor partition. The subscription itself must also have
+      message ordering enabled in Google Cloud Pub/Sub.
+
+      When `false` (default), messages are distributed across processors
+      without regard to ordering key, matching the unordered behaviour of a
+      standard Pub/Sub subscription.
+
+      Note: the server will also report whether the subscription has ordering
+      enabled in each `StreamingPullResponse.subscription_properties`. This
+      client-side option controls whether to enforce it in the Broadway
+      processing topology.
       """
     ],
 
@@ -239,15 +323,6 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
   def type_integer_in_range(value, [{:name, name}, {:min, min}, {:max, max}]) do
     {:error,
      "expected :#{name} to be an integer between #{min} and #{max}, got: #{inspect(value)}"}
-  end
-
-  def type_float_between_0_and_1(value, _) when is_float(value) and value > 0.0 and value < 1.0 do
-    {:ok, value}
-  end
-
-  def type_float_between_0_and_1(value, [{:name, name}]) do
-    {:error,
-     "expected :#{name} to be a float between 0.0 and 1.0 exclusive, got: #{inspect(value)}"}
   end
 
   def type_ack_option(:ack, _), do: {:ok, :ack}

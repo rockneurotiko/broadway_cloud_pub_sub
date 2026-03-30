@@ -1,0 +1,388 @@
+defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
+  use ExUnit.Case, async: true
+
+  alias BroadwayCloudPubSub.Streaming.AckBatcher
+
+  # A spy GenServer that records every call it receives and forwards them to
+  # the test process so we can assert on them. Returns :ok to all calls so
+  # AckBatcher sees {:ok, []} (full success) for every flush.
+  defmodule SpyRpcClient do
+    use GenServer
+
+    def start_link(opts) do
+      {name, opts} = Keyword.pop(opts, :name)
+      {test_pid, _} = Keyword.pop(opts, :test_pid)
+
+      if name do
+        GenServer.start_link(__MODULE__, test_pid, name: name)
+      else
+        GenServer.start_link(__MODULE__, test_pid)
+      end
+    end
+
+    def init(test_pid), do: {:ok, test_pid}
+
+    # Spy on call-based API — notify test process and return :ok so
+    # AckBatcher accumulates {:ok, []} (all delivered, nothing retained).
+    def handle_call({:acknowledge, _ack_ids} = msg, _from, test_pid) do
+      send(test_pid, {:rpc, msg})
+      {:reply, :ok, test_pid}
+    end
+
+    def handle_call({:modify_ack_deadline, _ids, _deadline} = msg, _from, test_pid) do
+      send(test_pid, {:rpc, msg})
+      {:reply, :ok, test_pid}
+    end
+
+    def handle_call(:ping, _from, state), do: {:reply, :ok, state}
+  end
+
+  # A spy that returns {:error, :unavailable} for the first call, then :ok.
+  defmodule FlakyRpcClient do
+    use GenServer
+
+    def start_link(test_pid) do
+      GenServer.start_link(__MODULE__, {test_pid, 0})
+    end
+
+    def init(state), do: {:ok, state}
+
+    def handle_call({:acknowledge, ack_ids}, _from, {test_pid, call_count}) do
+      send(test_pid, {:rpc, {:acknowledge, ack_ids}, call_count})
+      reply = if call_count == 0, do: {:error, :unavailable}, else: :ok
+      {:reply, reply, {test_pid, call_count + 1}}
+    end
+
+    def handle_call({:modify_ack_deadline, _ids, _deadline} = msg, _from, {test_pid, count}) do
+      send(test_pid, {:rpc, msg, count})
+      {:reply, :ok, {test_pid, count + 1}}
+    end
+  end
+
+  # A spy that always fails modack for deadline=30 but succeeds for deadline=60.
+  defmodule SelectiveFlakyRpc do
+    use GenServer
+
+    def start_link(test_pid) do
+      GenServer.start_link(__MODULE__, {test_pid, 0})
+    end
+
+    def init(state), do: {:ok, state}
+
+    def handle_call({:acknowledge, _ids}, _from, {test_pid, count}) do
+      {:reply, :ok, {test_pid, count + 1}}
+    end
+
+    def handle_call({:modify_ack_deadline, ids, deadline}, _from, {test_pid, count}) do
+      send(test_pid, {:rpc, {:modack, ids, deadline}, count})
+      reply = if deadline == 30 and count == 0, do: {:error, :unavailable}, else: :ok
+      {:reply, reply, {test_pid, count + 1}}
+    end
+  end
+
+  # Start a spy RPC client + AckBatcher pair.
+  # Returns {batcher_pid, rpc_client_pid}.
+  defp start_batcher(extra_opts \\ []) do
+    test_pid = self()
+
+    {:ok, rpc_pid} = SpyRpcClient.start_link(test_pid: test_pid)
+
+    opts =
+      Keyword.merge(
+        [
+          rpc_client: rpc_pid,
+          ack_batch_interval_ms: 50,
+          ack_batch_max_size: 10
+        ],
+        extra_opts
+      )
+
+    {:ok, batcher} = AckBatcher.start_link(opts)
+    {batcher, rpc_pid}
+  end
+
+  # ============================================================
+  # ack/2
+  # ============================================================
+
+  describe "ack/2" do
+    test "queues ack_ids and flushes them on the next timer tick" do
+      {batcher, _rpc} = start_batcher()
+
+      AckBatcher.ack(batcher, ["id-1", "id-2"])
+
+      # Timer fires after 50ms
+      assert_receive {:rpc, {:acknowledge, ids}}, 200
+      assert Enum.sort(ids) == ["id-1", "id-2"]
+    end
+
+    test "no-op when list is empty" do
+      {batcher, _rpc} = start_batcher()
+
+      AckBatcher.ack(batcher, [])
+
+      refute_receive {:rpc, _}, 100
+    end
+
+    test "accumulates multiple ack calls before flush" do
+      # Long interval so the timer doesn't fire mid-test
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000)
+
+      AckBatcher.ack(batcher, ["id-1"])
+      AckBatcher.ack(batcher, ["id-2"])
+      AckBatcher.ack(batcher, ["id-3"])
+
+      AckBatcher.flush(batcher)
+
+      assert_receive {:rpc, {:acknowledge, ids}}, 500
+      assert Enum.sort(ids) == ["id-1", "id-2", "id-3"]
+    end
+  end
+
+  # ============================================================
+  # modack/3
+  # ============================================================
+
+  describe "modack/3" do
+    test "queues modack_ids and flushes them on the next timer tick" do
+      {batcher, _rpc} = start_batcher()
+
+      AckBatcher.modack(batcher, ["id-a"], 30)
+
+      assert_receive {:rpc, {:modify_ack_deadline, ids, 30}}, 200
+      assert ids == ["id-a"]
+    end
+
+    test "groups modacks by deadline — one RPC per unique deadline per flush" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000)
+
+      AckBatcher.modack(batcher, ["id-1", "id-2"], 30)
+      AckBatcher.modack(batcher, ["id-3"], 60)
+      AckBatcher.modack(batcher, ["id-4"], 30)
+
+      AckBatcher.flush(batcher)
+
+      # We expect exactly two :modify_ack_deadline messages — one per deadline
+      rpcs = collect_rpcs(2, 500)
+
+      {ids_30, deadline_30} = find_modack(rpcs, 30)
+      {ids_60, deadline_60} = find_modack(rpcs, 60)
+
+      assert deadline_30 == 30
+      assert Enum.sort(ids_30) == ["id-1", "id-2", "id-4"]
+
+      assert deadline_60 == 60
+      assert ids_60 == ["id-3"]
+    end
+
+    test "no-op when list is empty" do
+      {batcher, _rpc} = start_batcher()
+
+      AckBatcher.modack(batcher, [], 30)
+
+      refute_receive {:rpc, _}, 100
+    end
+  end
+
+  # ============================================================
+  # flush/1
+  # ============================================================
+
+  describe "flush/1" do
+    test "flush/1 sends all pending acks and modacks synchronously" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000)
+
+      AckBatcher.ack(batcher, ["ack-1"])
+      AckBatcher.modack(batcher, ["mod-1"], 30)
+
+      :ok = AckBatcher.flush(batcher)
+
+      assert_receive {:rpc, {:acknowledge, _}}, 500
+      assert_receive {:rpc, {:modify_ack_deadline, _, 30}}, 500
+    end
+
+    test "flush/1 is a no-op when nothing is queued" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000)
+
+      :ok = AckBatcher.flush(batcher)
+
+      refute_receive {:rpc, _}, 100
+    end
+
+    test "flush/1 resets the state — subsequent timer does not re-send" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000)
+
+      AckBatcher.ack(batcher, ["id-1"])
+      :ok = AckBatcher.flush(batcher)
+
+      # Drain the flushed message
+      assert_receive {:rpc, {:acknowledge, _}}, 500
+
+      # Should receive no further RPC from a duplicate flush
+      refute_receive {:rpc, _}, 100
+    end
+  end
+
+  # ============================================================
+  # Max batch size — size-triggered flush
+  # ============================================================
+
+  describe "size-triggered flush" do
+    test "flushes immediately when ack_count reaches ack_batch_max_size" do
+      # batch_max_size = 3, long timer so only size triggers the flush
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000, ack_batch_max_size: 3)
+
+      AckBatcher.ack(batcher, ["id-1", "id-2", "id-3"])
+
+      # Should flush without waiting for the timer
+      assert_receive {:rpc, {:acknowledge, ids}}, 200
+      assert length(ids) == 3
+    end
+
+    test "flushes when combined ack + modack count reaches max_size" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000, ack_batch_max_size: 3)
+
+      AckBatcher.ack(batcher, ["id-1"])
+      AckBatcher.modack(batcher, ["id-2", "id-3"], 30)
+
+      # Combined count == 3 — should trigger flush
+      assert_receive {:rpc, _}, 200
+    end
+  end
+
+  # ============================================================
+  # Timer behaviour
+  # ============================================================
+
+  describe "timer" do
+    test "timer fires automatically without explicit flush" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 30)
+
+      AckBatcher.ack(batcher, ["timer-id"])
+
+      assert_receive {:rpc, {:acknowledge, ["timer-id"]}}, 300
+    end
+
+    test "timer resets after each flush — sends again on next tick" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 30)
+
+      AckBatcher.ack(batcher, ["tick-1"])
+      assert_receive {:rpc, {:acknowledge, _}}, 300
+
+      AckBatcher.ack(batcher, ["tick-2"])
+      assert_receive {:rpc, {:acknowledge, _}}, 300
+    end
+  end
+
+  # ============================================================
+  # Partial failure handling — acks retained on RPC failure
+  # ============================================================
+
+  describe "partial failure handling" do
+    test "ack_ids are retained in state when flush fails and retried on next tick" do
+      test_pid = self()
+      {:ok, flaky} = FlakyRpcClient.start_link(test_pid)
+
+      {:ok, batcher} =
+        AckBatcher.start_link(
+          rpc_client: flaky,
+          ack_batch_interval_ms: 40,
+          ack_batch_max_size: 100
+        )
+
+      AckBatcher.ack(batcher, ["id-1", "id-2"])
+
+      # First timer tick — RPC fails, ack_ids retained
+      assert_receive {:rpc, {:acknowledge, first_ids}, 0}, 300
+      assert Enum.sort(first_ids) == ["id-1", "id-2"]
+
+      # Second timer tick — RPC succeeds, ack_ids cleared
+      assert_receive {:rpc, {:acknowledge, retry_ids}, 1}, 300
+      assert Enum.sort(retry_ids) == ["id-1", "id-2"]
+
+      # After successful flush, state should be clear — no further RPCs
+      refute_receive {:rpc, {:acknowledge, _}, _}, 100
+    end
+
+    test "modack_ids for a failing deadline group are retained independently" do
+      test_pid = self()
+
+      {:ok, selective} = SelectiveFlakyRpc.start_link(test_pid)
+
+      {:ok, batcher} =
+        AckBatcher.start_link(
+          rpc_client: selective,
+          ack_batch_interval_ms: 40,
+          ack_batch_max_size: 100
+        )
+
+      AckBatcher.modack(batcher, ["id-30"], 30)
+      AckBatcher.modack(batcher, ["id-60"], 60)
+
+      # First tick: deadline=30 fails, deadline=60 succeeds
+      # Both are attempted in the same flush (Enum.reduce over modack_ids)
+      assert_receive {:rpc, {:modack, _, 30}, 0}, 300
+      assert_receive {:rpc, {:modack, _, 60}, _}, 300
+
+      # Second tick: deadline=30 is retried (count=1 now → succeeds), deadline=60 is gone
+      assert_receive {:rpc, {:modack, ["id-30"], 30}, _}, 300
+      refute_receive {:rpc, {:modack, ["id-60"], 60}, _}, 100
+    end
+  end
+
+  # ============================================================
+  # RPC client unavailable — defer flush
+  # ============================================================
+
+  describe "RPC client unavailability" do
+    test "flush is deferred gracefully when rpc_client process is not registered" do
+      # Use a name that is never registered so GenServer.whereis returns nil
+      fake_name = Module.concat(__MODULE__, "NeverRegistered#{System.unique_integer()}")
+
+      {:ok, batcher} =
+        AckBatcher.start_link(
+          rpc_client: fake_name,
+          ack_batch_interval_ms: 50,
+          ack_batch_max_size: 100
+        )
+
+      AckBatcher.ack(batcher, ["id-orphan"])
+
+      # Flush should not crash the batcher even though rpc_client is not alive
+      :ok = AckBatcher.flush(batcher)
+
+      assert Process.alive?(batcher)
+
+      # Ack_ids must still be retained (not silently dropped)
+      state = :sys.get_state(batcher)
+      assert state.ack_count == 1
+      assert state.ack_ids == ["id-orphan"]
+    end
+  end
+
+  # ============================================================
+  # Helpers
+  # ============================================================
+
+  # Collect exactly `count` {:rpc, _} messages from the mailbox within `timeout` ms.
+  defp collect_rpcs(count, timeout) do
+    Enum.map(1..count, fn _ ->
+      receive do
+        {:rpc, msg} -> msg
+      after
+        timeout -> flunk("Expected #{count} RPC messages but timed out")
+      end
+    end)
+  end
+
+  defp find_modack(rpcs, deadline) do
+    result =
+      Enum.find_value(rpcs, fn
+        {:modify_ack_deadline, ids, ^deadline} -> {ids, deadline}
+        _ -> nil
+      end)
+
+    assert result, "Expected :modify_ack_deadline with deadline #{deadline}"
+    result
+  end
+end

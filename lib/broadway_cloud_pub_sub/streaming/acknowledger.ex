@@ -38,16 +38,24 @@ defmodule BroadwayCloudPubSub.Streaming.Acknowledger do
 
   @impl Acknowledger
   def ack(ack_ref, successful, failed) do
-    {manager_pid, config} = :persistent_term.get(ack_ref)
+    # persistent_term stores the manager's registered *name*, not its PID,
+    # so this survives a StreamManager restart. Use the 2-arity form with a nil
+    # default so that if the pipeline shuts down and the key is erased before
+    # this callback runs we silently skip the dispatch rather than raising.
+    case :persistent_term.get(ack_ref, nil) do
+      nil ->
+        :ok
 
-    success_actions = group_actions_ack_ids(successful, :on_success, config)
-    failure_actions = group_actions_ack_ids(failed, :on_failure, config)
+      {manager_server, config} ->
+        success_actions = group_actions_ack_ids(successful, :on_success, config)
+        failure_actions = group_actions_ack_ids(failed, :on_failure, config)
 
-    success_actions
-    |> Map.merge(failure_actions, fn _, a, b -> a ++ b end)
-    |> dispatch_acks(manager_pid)
+        success_actions
+        |> Map.merge(failure_actions, fn _, a, b -> a ++ b end)
+        |> dispatch_acks(manager_server)
 
-    :ok
+        :ok
+    end
   end
 
   @impl Acknowledger
@@ -72,21 +80,21 @@ defmodule BroadwayCloudPubSub.Streaming.Acknowledger do
 
   defp extract_ack_id(%{acknowledger: {_, _, %{ack_id: ack_id}}}), do: ack_id
 
-  defp dispatch_acks(actions_and_ids, manager_pid) do
+  defp dispatch_acks(actions_and_ids, manager_server) do
     Enum.each(actions_and_ids, fn {action, ack_ids} ->
       ack_ids
       |> Enum.chunk_every(@max_ack_ids_per_request)
-      |> Enum.each(&apply_action(action, &1, manager_pid))
+      |> Enum.each(&apply_action(action, &1, manager_server))
     end)
   end
 
-  defp apply_action(:noop, _ack_ids, _manager_pid), do: :ok
+  defp apply_action(:noop, _ack_ids, _manager_server), do: :ok
 
-  defp apply_action(:ack, ack_ids, manager_pid) do
-    BroadwayCloudPubSub.Streaming.StreamManager.acknowledge(manager_pid, ack_ids)
+  defp apply_action(:ack, ack_ids, manager_server) do
+    BroadwayCloudPubSub.Streaming.StreamManager.acknowledge(manager_server, ack_ids)
   end
 
-  defp apply_action({:nack, deadline}, ack_ids, manager_pid) do
-    BroadwayCloudPubSub.Streaming.StreamManager.modify_deadline(manager_pid, ack_ids, deadline)
+  defp apply_action({:nack, deadline}, ack_ids, manager_server) do
+    BroadwayCloudPubSub.Streaming.StreamManager.modify_deadline(manager_server, ack_ids, deadline)
   end
 end

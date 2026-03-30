@@ -249,4 +249,30 @@ defmodule BroadwayCloudPubSub.Streaming.OptionsTest do
                Options.type_shutdown_option(:ack, name: :on_shutdown)
     end
   end
+
+  describe "enable_message_ordering" do
+    test "defaults to false" do
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s")
+      assert opts[:enable_message_ordering] == false
+    end
+
+    test "accepts true" do
+      {:ok, opts} =
+        validate(subscription: "projects/p/subscriptions/s", enable_message_ordering: true)
+
+      assert opts[:enable_message_ordering] == true
+    end
+
+    test "accepts false explicitly" do
+      {:ok, opts} =
+        validate(subscription: "projects/p/subscriptions/s", enable_message_ordering: false)
+
+      assert opts[:enable_message_ordering] == false
+    end
+
+    test "rejects non-boolean" do
+      assert {:error, _} =
+               validate(subscription: "projects/p/subscriptions/s", enable_message_ordering: 1)
+    end
+  end
 end
