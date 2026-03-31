@@ -448,20 +448,28 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   # ordering_key are all routed to partition 0 (unordered messages interleave freely).
   defp maybe_inject_partition_by(broadway_opts, opts) do
     if opts[:enable_message_ordering] do
-      partition_fn = fn %Broadway.Message{metadata: %{orderingKey: key}} ->
-        key or ""
-      end
-
       processors =
         broadway_opts
         |> Keyword.get(:processors, [])
         |> Enum.map(fn {name, proc_opts} ->
-          {name, Keyword.put_new(proc_opts, :partition_by, partition_fn)}
+          {name, Keyword.put_new(proc_opts, :partition_by, &__MODULE__.partition_by/1)}
         end)
 
       Keyword.put(broadway_opts, :processors, processors)
     else
       broadway_opts
     end
+  end
+
+  def partition_by(%Broadway.Message{metadata: %{orderingKey: key}}) when is_binary(key) do
+    :erlang.phash2(key)
+  end
+
+  def partition_by(%Broadway.Message{metadata: %{orderingKey: key}}) when is_integer(key) do
+    key
+  end
+
+  def partition_by(_) do
+    :erlang.unique_integer([:positive])
   end
 end

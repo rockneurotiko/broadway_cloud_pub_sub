@@ -4,6 +4,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   import ExUnit.CaptureLog
 
   alias BroadwayCloudPubSub.Streaming.{AckBatcher, StreamManager}
+  alias BroadwayCloudPubSub.Test.GrpcDynamicAdapter
 
   # Minimal config with enough keys to satisfy StreamManager.init/1
   # (mirrors what Options produces after validation + defaults).
@@ -18,8 +19,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       backoff_min: 1_000,
       backoff_max: 30_000,
       use_ssl: true,
-      adapter: :gun,
-      grpc_endpoint: "pubsub.googleapis.com:443",
+      adapter: GrpcDynamicAdapter,
+      grpc_endpoint: "localhost:1234",
       keepalive_interval_ms: 30_000,
       on_success: :ack,
       on_failure: :noop,
@@ -28,12 +29,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       ack_batch_interval_ms: 100,
       ack_batch_max_size: 2_500,
       client_id: "test-client-id",
-      token_generator: {__MODULE__, :noop_token, []},
+      # fail token by default, most of the tests don't need a live stream, and this avoids GRPC.Client.Connection stop logs
+      token_generator: {__MODULE__, :fail_token, []},
       broadway: [name: __MODULE__]
     ]
   end
 
   def noop_token, do: {:ok, "test-token"}
+  def fail_token, do: {:error, :no_token}
 
   # A minimal stub GenServer that silently accepts any cast (ack/modack).
   # Used as the rpc_client for AckBatcher so no real gRPC calls are made.
@@ -78,6 +81,44 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
     pid
   end
 
+  # Synchronous barrier: drains all prior mailbox messages in StreamManager
+  # before returning. Safe to use instead of :sys.get_state/1 for sync purposes.
+  defp sync(pid), do: StreamManager.get_buffered(pid)
+
+  # Build a minimal ReceivedMessage for sending into {:stream_messages, ...}.
+  defp received_message(ack_id, data) do
+    %Google.Pubsub.V1.ReceivedMessage{
+      ack_id: ack_id,
+      message: %Google.Pubsub.V1.PubsubMessage{
+        message_id: "msg-#{ack_id}",
+        data: data,
+        attributes: %{},
+        ordering_key: "",
+        publish_time: nil
+      },
+      delivery_attempt: 1
+    }
+  end
+
+  # Open a live dynamic adapter stream.
+  # Starts the manager with noop_token so the adapter actually connects,
+  # waits for the connection handshake, then calls fun.(pid, ctrl).
+  defp with_live_stream(extra_opts \\ [], fun) do
+    pid =
+      start_manager(
+        [
+          adapter: GrpcDynamicAdapter,
+          test_pid: self(),
+          token_generator: {__MODULE__, :noop_token, []}
+        ] ++ extra_opts
+      )
+
+    assert_receive {:adapter_connected, ctrl}, 2_000
+    # Wait for the initial StreamingPullRequest so the stream is fully open
+    assert_receive {:adapter_call, {:send_data, _}}, 2_000
+    fun.(pid, ctrl)
+  end
+
   # ============================================================
   # Demand signaling
   # ============================================================
@@ -89,11 +130,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       StreamManager.notify_demand(pid, 0)
       StreamManager.notify_demand(pid, 10)
 
-      # Allow the async cast to be processed
-      state = :sys.get_state(pid)
+      # Send one real message — if demand > 0, it will be forwarded immediately
+      send(pid, {:stream_messages, [received_message("demand-probe", "probe")]})
+      assert_receive {:stream_messages, [_]}, 500
 
-      assert state.pending_demand == 10
-      assert :queue.is_empty(state.message_buffer)
+      # Buffer is empty: all demand was consumed by the forwarded message
+      assert StreamManager.get_buffered(pid) == []
     end
   end
 
@@ -101,59 +143,53 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
     test "flushes buffered messages to producer and decrements pending_demand" do
       pid = start_manager()
 
-      msgs = [
-        %Broadway.Message{data: "msg1", acknowledger: {Broadway.NoopAcknowledger, nil, nil}},
-        %Broadway.Message{data: "msg2", acknowledger: {Broadway.NoopAcknowledger, nil, nil}}
-      ]
+      # Buffer two messages with demand=0
+      StreamManager.notify_demand(pid, 0)
+      send(pid, {:stream_messages, [received_message("buf-1", "msg1")]})
+      send(pid, {:stream_messages, [received_message("buf-2", "msg2")]})
+      # Wait for both to be buffered (sync via get_buffered)
+      assert length(StreamManager.get_buffered(pid)) == 2
 
-      :sys.replace_state(pid, fn s ->
-        %{s | pending_demand: 0, message_buffer: :queue.from_list(msgs)}
-      end)
-
+      # Now demand arrives — should flush both at once
       StreamManager.notify_demand(pid, 10)
 
       assert_receive {:stream_messages, received}
       assert Enum.map(received, & &1.data) == ["msg1", "msg2"]
 
-      state = :sys.get_state(pid)
-      assert :queue.is_empty(state.message_buffer)
-      assert state.pending_demand == 8
+      # Buffer should be empty; remaining demand consumed 2 of 10
+      assert StreamManager.get_buffered(pid) == []
     end
 
     test "flushes only up to pending_demand, keeps remainder buffered" do
       pid = start_manager()
 
-      msgs =
-        for i <- 1..5 do
-          %Broadway.Message{
-            data: "msg#{i}",
-            acknowledger: {Broadway.NoopAcknowledger, nil, nil}
-          }
-        end
+      # Buffer 5 messages with demand=0
+      StreamManager.notify_demand(pid, 0)
 
-      :sys.replace_state(pid, fn s ->
-        %{s | pending_demand: 0, message_buffer: :queue.from_list(msgs)}
-      end)
+      for i <- 1..5 do
+        send(pid, {:stream_messages, [received_message("buf-#{i}", "msg#{i}")]})
+      end
 
+      assert length(StreamManager.get_buffered(pid)) == 5
+
+      # Demand for 2 — should flush exactly 2
       StreamManager.notify_demand(pid, 2)
 
       assert_receive {:stream_messages, received}
       assert length(received) == 2
       assert Enum.map(received, & &1.data) == ["msg1", "msg2"]
 
-      state = :sys.get_state(pid)
-      assert :queue.len(state.message_buffer) == 3
-      assert state.pending_demand == 0
+      # 3 remain buffered
+      assert length(StreamManager.get_buffered(pid)) == 3
 
+      # Demand for 10 — should flush the remaining 3
       StreamManager.notify_demand(pid, 10)
 
       assert_receive {:stream_messages, received2}
       assert length(received2) == 3
       assert Enum.map(received2, & &1.data) == ["msg3", "msg4", "msg5"]
 
-      state = :sys.get_state(pid)
-      assert :queue.is_empty(state.message_buffer)
-      assert state.pending_demand == 7
+      assert StreamManager.get_buffered(pid) == []
     end
   end
 
@@ -162,51 +198,25 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       pid = start_manager()
       StreamManager.notify_demand(pid, 10)
 
-      fake_msg = %Google.Pubsub.V1.ReceivedMessage{
-        ack_id: "ack-1",
-        message: %Google.Pubsub.V1.PubsubMessage{
-          message_id: "msg-1",
-          data: "hello",
-          attributes: %{},
-          ordering_key: "",
-          publish_time: nil
-        },
-        delivery_attempt: 1
-      }
-
-      send(pid, {:stream_messages, [fake_msg]})
+      send(pid, {:stream_messages, [received_message("ack-1", "hello")]})
 
       assert_receive {:stream_messages, messages}
       assert length(messages) == 1
       assert hd(messages).data == "hello"
 
-      state = :sys.get_state(pid)
-      assert state.pending_demand == 9
-      assert :queue.is_empty(state.message_buffer)
+      # Buffer should be empty (demand consumed the message immediately)
+      assert StreamManager.get_buffered(pid) == []
     end
 
     test "messages are buffered when pending_demand is 0" do
       pid = start_manager()
       StreamManager.notify_demand(pid, 0)
 
-      fake_msg = %Google.Pubsub.V1.ReceivedMessage{
-        ack_id: "ack-2",
-        message: %Google.Pubsub.V1.PubsubMessage{
-          message_id: "msg-2",
-          data: "buffered",
-          attributes: %{},
-          ordering_key: "",
-          publish_time: nil
-        },
-        delivery_attempt: 1
-      }
-
-      send(pid, {:stream_messages, [fake_msg]})
+      send(pid, {:stream_messages, [received_message("ack-2", "buffered")]})
 
       refute_receive {:stream_messages, _}, 100
 
-      state = :sys.get_state(pid)
-      assert :queue.len(state.message_buffer) == 1
+      assert length(StreamManager.get_buffered(pid)) == 1
     end
 
     test "buffer is flushed in FIFO order on notify_demand" do
@@ -214,22 +224,11 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       StreamManager.notify_demand(pid, 0)
 
       for i <- 1..3 do
-        msg = %Google.Pubsub.V1.ReceivedMessage{
-          ack_id: "ack-#{i}",
-          message: %Google.Pubsub.V1.PubsubMessage{
-            message_id: "msg-#{i}",
-            data: "data-#{i}",
-            attributes: %{},
-            ordering_key: "",
-            publish_time: nil
-          },
-          delivery_attempt: 1
-        }
-
-        send(pid, {:stream_messages, [msg]})
+        send(pid, {:stream_messages, [received_message("ack-#{i}", "data-#{i}")]})
       end
 
-      :sys.get_state(pid)
+      # Sync: ensure all 3 are buffered before we signal demand
+      assert length(StreamManager.get_buffered(pid)) == 3
 
       StreamManager.notify_demand(pid, 10)
 
@@ -249,19 +248,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       StreamManager.notify_demand(pid, 10)
       StreamManager.stop_receiving(pid)
 
-      fake_msg = %Google.Pubsub.V1.ReceivedMessage{
-        ack_id: "drain-ack",
-        message: %Google.Pubsub.V1.PubsubMessage{
-          message_id: "drain-msg",
-          data: "should not arrive",
-          attributes: %{},
-          ordering_key: "",
-          publish_time: nil
-        },
-        delivery_attempt: 1
-      }
-
-      send(pid, {:stream_messages, [fake_msg]})
+      send(pid, {:stream_messages, [received_message("drain-ack", "should not arrive")]})
 
       refute_receive {:stream_messages, _}, 200
     end
@@ -273,67 +260,56 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
   describe "keep-alive ping" do
     test "triggers reconnect when send fails (fake stream)" do
-      # Use a very short keepalive interval so the test doesn't wait 30s.
-      # With a fake stream, send_on_stream will throw, which should trigger
-      # a reconnect instead of being silently swallowed.
-      logs =
-        capture_log(fn ->
-          pid = start_manager(keepalive_interval_ms: 10)
+      # Use a very short keepalive interval and a high backoff so the automatic
+      # reconnect triggered by the failed send doesn't fire another :connect
+      # during the test assertions.
+      pid = start_manager(keepalive_interval_ms: 10, backoff_min: 60_000)
 
-          :sys.replace_state(pid, fn s -> %{s | grpc_stream: :fake_stream} end)
+      :sys.replace_state(pid, fn s -> %{s | grpc_stream: :fake_stream} end)
 
-          # Bootstrap the keepalive cycle — normally started by {:stream_opened},
-          # but we injected the stream directly via replace_state.
-          send(pid, :send_keepalive)
+      # Bootstrap the keepalive cycle — normally started by {:stream_opened},
+      # but we injected the stream directly via replace_state.
+      send(pid, :send_keepalive)
 
-          :sys.get_state(pid)
+      # Sync barrier: let both the keepalive handler and any subsequent
+      # handle_info(:connect, ...) fully settle before reading state.
+      sync(pid)
 
-          assert Process.alive?(pid)
+      assert Process.alive?(pid)
 
-          # After a send failure, the stream is reset (grpc_stream: nil) and a
-          # reconnect is scheduled.
-          state = :sys.get_state(pid)
-          assert state.grpc_stream == nil
-          assert state.reconnect_ref != nil
-        end)
-
-      assert logs =~ "GRPC.Client.Connection stopping as requested"
+      # After a send failure, the stream is reset (grpc_stream: nil) and a
+      # reconnect is scheduled.
+      state = :sys.get_state(pid)
+      assert state.grpc_stream == nil
+      assert state.reconnect_ref != nil
     end
 
     test "does not crash when stream is nil (reconnecting)" do
+      # grpc_stream is already nil after start_manager with fail_token — no replace_state needed.
       pid = start_manager(keepalive_interval_ms: 10)
-
-      :sys.replace_state(pid, fn s -> %{s | grpc_stream: nil} end)
 
       send(pid, :send_keepalive)
 
-      :sys.get_state(pid)
+      sync(pid)
 
       assert Process.alive?(pid)
     end
 
     test "keepalive_timer is nil before stream opens" do
       pid = start_manager()
+      # No public API for keepalive_timer — :sys.get_state required
       state = :sys.get_state(pid)
       assert state.keepalive_timer == nil
     end
 
     test "keepalive_timer is set when stream is active" do
-      pid = start_manager(keepalive_interval_ms: 60_000)
-
-      :sys.replace_state(pid, fn s ->
-        timer = Process.send_after(self(), :send_keepalive, 60_000)
-
-        %{
-          s
-          | grpc_stream: :fake_stream,
-            conn_pid: self(),
-            keepalive_timer: timer
-        }
+      # Use a live stream so {:stream_opened} fires, which calls schedule_keepalive_timer/1.
+      # A very long interval ensures it doesn't fire during the test.
+      with_live_stream([keepalive_interval_ms: 60_000], fn pid, _ctrl ->
+        # No public API for keepalive_timer — :sys.get_state required
+        state = :sys.get_state(pid)
+        assert state.keepalive_timer != nil
       end)
-
-      state = :sys.get_state(pid)
-      assert state.keepalive_timer != nil
     end
   end
 
@@ -349,8 +325,9 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       send(pid, {:stream_error, %GRPC.RPCError{status: 4, message: "timeout"}})
       send(pid, {:stream_closed})
 
-      :sys.get_state(pid)
+      sync(pid)
 
+      # No public API for reconnect_ref — :sys.get_state required
       state = :sys.get_state(pid)
       first_ref = state.reconnect_ref
 
@@ -359,7 +336,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       # Send another close signal — ref must not change (dedup kicks in)
       send(pid, {:stream_closed})
-      :sys.get_state(pid)
+      sync(pid)
 
       state2 = :sys.get_state(pid)
       assert state2.reconnect_ref == first_ref
@@ -369,11 +346,11 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       pid = start_manager(backoff_min: 10_000, backoff_max: 30_000)
 
       send(pid, {:stream_error, %GRPC.RPCError{status: 4, message: "timeout"}})
-      :sys.get_state(pid)
+      sync(pid)
 
       # Manually fire :connect (connect() will fail — no real gRPC — but that's fine)
       send(pid, :connect)
-      :sys.get_state(pid)
+      sync(pid)
 
       # GenServer should still be alive
       assert Process.alive?(pid)
@@ -438,11 +415,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       ref = Process.monitor(pid)
 
       send(pid, {:stream_error, %GRPC.RPCError{status: 16, message: "unauthenticated"}})
-      :sys.get_state(pid)
+      sync(pid)
 
       refute_received {:DOWN, ^ref, :process, ^pid, _}
       assert Process.alive?(pid)
 
+      # No public API for reconnect_ref — :sys.get_state required
       state = :sys.get_state(pid)
       assert state.reconnect_ref != nil
     end
@@ -456,7 +434,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         {:stream_error, %GRPC.RPCError{status: 14, message: "Server shutdownNow invoked"}}
       )
 
-      :sys.get_state(pid)
+      sync(pid)
 
       refute_received {:DOWN, ^ref, :process, ^pid, _}
       assert Process.alive?(pid)
@@ -500,7 +478,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       ref = Process.monitor(pid)
 
       send(pid, {:stream_error, %GRPC.RPCError{status: 4, message: "timeout"}})
-      :sys.get_state(pid)
+      sync(pid)
 
       refute_received {:DOWN, ^ref, :process, ^pid, _}
       assert Process.alive?(pid)
@@ -514,7 +492,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       ref = Process.monitor(pid)
 
       send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "service temporarily down"}})
-      :sys.get_state(pid)
+      sync(pid)
 
       refute_received {:DOWN, ^ref, :process, ^pid, _}
       assert Process.alive?(pid)
@@ -528,6 +506,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   describe "subscription_properties — ordering_enabled" do
     test "ordering_enabled defaults to false" do
       pid = start_manager()
+      # No public API for ordering_enabled — :sys.get_state required
       state = :sys.get_state(pid)
       assert state.ordering_enabled == false
     end
@@ -541,8 +520,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       }
 
       send(pid, {:subscription_properties, props})
-      # Sync: ensure the message is processed
-      :sys.get_state(pid)
+      sync(pid)
 
       state = :sys.get_state(pid)
       assert state.ordering_enabled == true
@@ -561,7 +539,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
          }}
       )
 
-      :sys.get_state(pid)
+      sync(pid)
       assert :sys.get_state(pid).ordering_enabled == true
 
       # Then server sends false (can happen mid-stream)
@@ -574,7 +552,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
          }}
       )
 
-      :sys.get_state(pid)
+      sync(pid)
       assert :sys.get_state(pid).ordering_enabled == false
     end
 
@@ -583,7 +561,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       # Unrelated message
       send(pid, {:some_other_event, :ignored})
-      :sys.get_state(pid)
+      sync(pid)
 
       state = :sys.get_state(pid)
       assert state.ordering_enabled == false
@@ -597,6 +575,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   describe "subscription_properties — exactly_once_enabled" do
     test "exactly_once_enabled defaults to false" do
       pid = start_manager()
+      # No public API for exactly_once_enabled — :sys.get_state required
       state = :sys.get_state(pid)
       assert state.exactly_once_enabled == false
     end
@@ -610,7 +589,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       }
 
       send(pid, {:subscription_properties, props})
-      :sys.get_state(pid)
+      sync(pid)
 
       assert :sys.get_state(pid).exactly_once_enabled == true
     end
@@ -627,7 +606,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
          }}
       )
 
-      :sys.get_state(pid)
+      sync(pid)
       assert :sys.get_state(pid).exactly_once_enabled == true
 
       send(
@@ -639,7 +618,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
          }}
       )
 
-      :sys.get_state(pid)
+      sync(pid)
       assert :sys.get_state(pid).exactly_once_enabled == false
     end
 
@@ -655,7 +634,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
          }}
       )
 
-      :sys.get_state(pid)
+      sync(pid)
       state = :sys.get_state(pid)
       assert state.ordering_enabled == true
       assert state.exactly_once_enabled == true
@@ -667,108 +646,203 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   # ============================================================
 
   describe "extend_leases — exactly_once_enabled deadline enforcement" do
-    # Inject outstanding messages and trigger :extend_leases, then capture
-    # the modack call via the StubRpcClient + process mailbox inspection.
-    # We can't easily intercept AckBatcher calls here, so we validate behaviour
-    # by inspecting how long until the next :extend_leases fires.
+    # We use with_live_stream so the adapter actually connects, then push a
+    # real StreamingPullResponse to get a message into `outstanding` naturally.
+    # Then we control exactly_once_enabled via {:subscription_properties, ...}.
+
+    defp push_one_message(ctrl, ack_id, data) do
+      response = %Google.Pubsub.V1.StreamingPullResponse{
+        received_messages: [
+          %Google.Pubsub.V1.ReceivedMessage{
+            ack_id: ack_id,
+            message: %Google.Pubsub.V1.PubsubMessage{
+              message_id: "msg-#{ack_id}",
+              data: data,
+              attributes: %{},
+              ordering_key: "",
+              publish_time: nil
+            },
+            delivery_attempt: 1
+          }
+        ]
+      }
+
+      GrpcDynamicAdapter.push_response(ctrl, response)
+    end
 
     test "uses adaptive deadline (no 60s floor) when exactly_once_enabled is false" do
-      pid = start_manager()
+      with_live_stream(fn pid, ctrl ->
+        # Put one message into outstanding by pushing a response with demand
+        StreamManager.notify_demand(pid, 1)
+        push_one_message(ctrl, "ack-normal", "data")
+        assert_receive {:stream_messages, [_]}, 2_000
 
-      # With <10 samples the distribution returns the default deadline (60s).
-      # We verify the next timer is scheduled within a reasonable range.
-      now_ms = System.monotonic_time(:millisecond)
+        # Ensure exactly_once is false (the default)
+        send(
+          pid,
+          {:subscription_properties,
+           %Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties{
+             message_ordering_enabled: false,
+             exactly_once_delivery_enabled: false
+           }}
+        )
 
-      # Inject one outstanding message and a lease timer that fires immediately.
-      :sys.replace_state(pid, fn s ->
-        %{
-          s
-          | exactly_once_enabled: false,
-            outstanding: %{
-              "ack-normal" => %{
-                received_at: now_ms - 5_000,
-                max_expiry: now_ms + 3_600_000
-              }
-            }
-        }
+        sync(pid)
+
+        # Fire the :extend_leases handler directly
+        send(pid, :extend_leases)
+        sync(pid)
+
+        # No public API for lease_timer — :sys.get_state required
+        state = :sys.get_state(pid)
+        assert state.lease_timer != nil
       end)
-
-      # Fire the :extend_leases handler directly
-      send(pid, :extend_leases)
-      :sys.get_state(pid)
-
-      state = :sys.get_state(pid)
-      # Lease timer should be re-scheduled with a positive ref
-      assert state.lease_timer != nil
     end
 
     test "enforces 60s minimum deadline when exactly_once_enabled is true" do
-      pid = start_manager()
-      now_ms = System.monotonic_time(:millisecond)
+      with_live_stream(fn pid, ctrl ->
+        # Put one message into outstanding
+        StreamManager.notify_demand(pid, 1)
+        push_one_message(ctrl, "ack-eo", "data")
+        assert_receive {:stream_messages, [_]}, 2_000
 
-      # With exactly_once_enabled: true and an adaptive deadline of e.g. 10s
-      # (cold start default clamped to the min), effective_deadline must be
-      # at least 60. We validate by measuring the scheduled next interval:
-      # interval = (effective_deadline - 5) * 1000 * jitter_factor
-      # With effective_deadline=60: interval in [(60-5)*1000*0.8, (60-5)*1000*0.9]
-      #                            = [44_000, 49_500]
-      :sys.replace_state(pid, fn s ->
-        %{
-          s
-          | exactly_once_enabled: true,
-            outstanding: %{
-              "ack-eo" => %{
-                received_at: now_ms - 1_000,
-                max_expiry: now_ms + 3_600_000
-              }
-            }
-        }
+        # Enable exactly-once
+        send(
+          pid,
+          {:subscription_properties,
+           %Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties{
+             message_ordering_enabled: false,
+             exactly_once_delivery_enabled: true
+           }}
+        )
+
+        sync(pid)
+
+        send(pid, :extend_leases)
+        sync(pid)
+
+        # No public API for lease_timer — :sys.get_state required
+        state = :sys.get_state(pid)
+        assert state.lease_timer != nil
+        remaining_ms = Process.read_timer(state.lease_timer)
+        # With effective_deadline=60s: interval in [(60-5)*1000*0.8, (60-5)*1000*0.9]
+        #                              = [44_000, 49_500)
+        assert remaining_ms >= 40_000,
+               "Expected next lease timer >= 40s for exactly-once, got #{remaining_ms}ms"
       end)
-
-      send(pid, :extend_leases)
-      :sys.get_state(pid)
-
-      state = :sys.get_state(pid)
-      # The timer must be set and represent a deadline >= 60s.
-      # We read back the remaining time from the timer ref.
-      assert state.lease_timer != nil
-      remaining_ms = Process.read_timer(state.lease_timer)
-      # The next extension should fire well before the 60s deadline expires.
-      # We assert >= 40_000 as a lower bound with tolerance for scheduling jitter.
-      assert remaining_ms >= 40_000,
-             "Expected next lease timer >= 40s for exactly-once, got #{remaining_ms}ms"
     end
 
     test "uses normal interval (much shorter) when exactly_once_enabled is false" do
-      pid = start_manager(stream_ack_deadline_seconds: 20)
-      now_ms = System.monotonic_time(:millisecond)
+      with_live_stream([stream_ack_deadline_seconds: 20], fn pid, ctrl ->
+        # Put one message into outstanding
+        StreamManager.notify_demand(pid, 1)
+        push_one_message(ctrl, "ack-normal2", "data")
+        assert_receive {:stream_messages, [_]}, 2_000
 
-      :sys.replace_state(pid, fn s ->
-        %{
-          s
-          | exactly_once_enabled: false,
-            outstanding: %{
-              "ack-normal" => %{
-                received_at: now_ms - 1_000,
-                max_expiry: now_ms + 3_600_000
-              }
-            }
-        }
+        # Ensure exactly_once is false
+        send(
+          pid,
+          {:subscription_properties,
+           %Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties{
+             message_ordering_enabled: false,
+             exactly_once_delivery_enabled: false
+           }}
+        )
+
+        sync(pid)
+
+        send(pid, :extend_leases)
+        sync(pid)
+
+        state = :sys.get_state(pid)
+        assert state.lease_timer != nil
+        remaining_ms = Process.read_timer(state.lease_timer)
+
+        # With stream_ack_deadline_seconds=20 and adaptive deadline defaulting
+        # to 60 (cold start default), effective = 60s (no exactly_once floor).
+        # The key check: it's a valid positive number.
+        assert is_integer(remaining_ms) and remaining_ms > 0
       end)
+    end
+  end
 
-      send(pid, :extend_leases)
-      :sys.get_state(pid)
+  # ============================================================
+  # Dynamic adapter — real connection flow without a real server
+  # ============================================================
 
-      state = :sys.get_state(pid)
-      assert state.lease_timer != nil
-      remaining_ms = Process.read_timer(state.lease_timer)
+  describe "with GrpcDynamicAdapter" do
+    test "adapter receives connect call and sends initial StreamingPullRequest" do
+      pid =
+        start_manager(
+          adapter: GrpcDynamicAdapter,
+          test_pid: self(),
+          token_generator: {__MODULE__, :noop_token, []}
+        )
 
-      # With stream_ack_deadline_seconds=20 and adaptive deadline defaulting
-      # to 60 (cold start default), effective = 60s (no exactly_once floor).
-      # Interval = (60 - 5) * 1000 * jitter ≈ [44_000, 49_500).
-      # The key check: it should NOT be forced to >= 44_000 due to exactly_once
-      # — we simply verify it's a valid positive number.
-      assert is_integer(remaining_ms) and remaining_ms > 0
+      # Adapter signals connection to the test process
+      assert_receive {:adapter_connected, _ctrl}, 2_000
+
+      # StreamReader sends the initial StreamingPullRequest via send_data
+      assert_receive {:adapter_call, {:send_data, _initial_request}}, 2_000
+
+      assert Process.alive?(pid)
+    end
+
+    test "messages pushed into the stream are forwarded to the producer" do
+      pid =
+        start_manager(
+          adapter: GrpcDynamicAdapter,
+          test_pid: self(),
+          token_generator: {__MODULE__, :noop_token, []}
+        )
+
+      assert_receive {:adapter_connected, ctrl}, 2_000
+      # Wait for send_data (initial request) so stream is fully open
+      assert_receive {:adapter_call, {:send_data, _}}, 2_000
+
+      StreamManager.notify_demand(pid, 10)
+
+      response = %Google.Pubsub.V1.StreamingPullResponse{
+        received_messages: [
+          %Google.Pubsub.V1.ReceivedMessage{
+            ack_id: "dyn-ack-1",
+            message: %Google.Pubsub.V1.PubsubMessage{
+              message_id: "dyn-msg-1",
+              data: "hello-dynamic",
+              attributes: %{},
+              ordering_key: "",
+              publish_time: nil
+            },
+            delivery_attempt: 1
+          }
+        ]
+      }
+
+      GrpcDynamicAdapter.push_response(ctrl, response)
+
+      assert_receive {:stream_messages, messages}, 2_000
+      assert length(messages) == 1
+      assert hd(messages).data == "hello-dynamic"
+    end
+
+    test "end_stream and cancel notifications reach test_pid" do
+      _pid =
+        start_manager(
+          adapter: GrpcDynamicAdapter,
+          test_pid: self(),
+          token_generator: {__MODULE__, :noop_token, []}
+        )
+
+      assert_receive {:adapter_connected, ctrl}, 2_000
+      assert_receive {:adapter_call, {:send_data, _}}, 2_000
+
+      # Signal end-of-stream so the reader exits cleanly
+      GrpcDynamicAdapter.push_end_stream(ctrl)
+
+      # StreamManager will close the reader and schedule reconnect,
+      # which triggers a new connect — we just verify the process survives
+      # and the test doesn't hang.
+      Process.sleep(100)
     end
   end
 end

@@ -208,7 +208,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       """
     ],
     adapter: [
-      type: {:in, [:gun, :mint]},
+      type: {:custom, __MODULE__, :type_adapter, [[{:name, :adapter}]]},
       default: :gun,
       doc: """
       The gRPC HTTP/2 adapter to use for the streaming connection.
@@ -217,9 +217,11 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
           and is the traditional adapter for the Elixir gRPC library.
         * `:mint` — Uses the Mint HTTP/2 client. Mint may be preferable in
           deployment environments where Gun is not available or not desired.
+        * Any module — A custom module implementing the `GRPC.Client.Adapter`
+          behaviour. Useful for test adapters and alternative implementations.
 
-      Both adapters are provided by the `grpc_client` dependency. The adapter choice
-      does not affect the public API or message semantics.
+      Both built-in adapters are provided by the `grpc_client` dependency. The
+      adapter choice does not affect the public API or message semantics.
       """
     ],
     grpc_endpoint: [
@@ -278,8 +280,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
     ],
 
     # Testing options
-    test_pid: [type: :pid, doc: false],
-    message_server: [type: :pid, doc: false]
+    test_pid: [type: :pid, doc: false]
   ]
 
   @definition NimbleOptions.new!(definition)
@@ -352,5 +353,32 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
     {:error,
      "expected :#{name} to be :nack, :noop, or {:nack, integer} where " <>
        "integer is between 0 and 600, got: #{inspect(value)}"}
+  end
+
+  def type_adapter(:gun, _), do: {:ok, GRPC.Client.Adapters.Gun}
+  def type_adapter(:mint, _), do: {:ok, GRPC.Client.Adapters.Mint}
+
+  def type_adapter(mod, [{:name, name}]) when is_atom(mod) do
+    case Code.ensure_loaded(mod) do
+      {:module, ^mod} ->
+        if function_exported?(mod, :connect, 2) do
+          {:ok, mod}
+        else
+          {:error,
+           "expected :#{name} to be a module implementing GRPC.Client.Adapter, " <>
+             "but #{inspect(mod)} does not export connect/2"}
+        end
+
+      {:error, _} ->
+        {:error,
+         "expected :#{name} to be :gun, :mint, or a module implementing GRPC.Client.Adapter, " <>
+           "but #{inspect(mod)} is not a loaded module"}
+    end
+  end
+
+  def type_adapter(value, [{:name, name}]) do
+    {:error,
+     "expected :#{name} to be :gun, :mint, or a module implementing GRPC.Client.Adapter, " <>
+       "got: #{inspect(value)}"}
   end
 end

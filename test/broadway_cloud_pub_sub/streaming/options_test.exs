@@ -250,6 +250,50 @@ defmodule BroadwayCloudPubSub.Streaming.OptionsTest do
     end
   end
 
+  describe "adapter" do
+    test "defaults to GRPC.Client.Adapters.Gun" do
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s")
+      assert opts[:adapter] == GRPC.Client.Adapters.Gun
+    end
+
+    test ":gun resolves to GRPC.Client.Adapters.Gun" do
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", adapter: :gun)
+      assert opts[:adapter] == GRPC.Client.Adapters.Gun
+    end
+
+    test ":mint resolves to GRPC.Client.Adapters.Mint" do
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", adapter: :mint)
+      assert opts[:adapter] == GRPC.Client.Adapters.Mint
+    end
+
+    test "accepts a custom module that exports connect/2" do
+      {:ok, opts} =
+        validate(
+          subscription: "projects/p/subscriptions/s",
+          adapter: BroadwayCloudPubSub.Test.GrpcTestAdapter
+        )
+
+      assert opts[:adapter] == BroadwayCloudPubSub.Test.GrpcTestAdapter
+    end
+
+    test "rejects a non-atom value" do
+      assert {:error, err} =
+               validate(subscription: "projects/p/subscriptions/s", adapter: "gun")
+
+      assert Exception.message(err) =~ "adapter"
+    end
+
+    test "rejects an atom that is not a loaded module" do
+      assert {:error, err} =
+               validate(
+                 subscription: "projects/p/subscriptions/s",
+                 adapter: VeryUnlikelyToExist.ModuleAtom
+               )
+
+      assert Exception.message(err) =~ "adapter"
+    end
+  end
+
   describe "enable_message_ordering" do
     test "defaults to false" do
       {:ok, opts} = validate(subscription: "projects/p/subscriptions/s")

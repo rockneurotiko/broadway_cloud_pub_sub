@@ -350,16 +350,12 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
       end
 
     with {:ok, token} <- token_result do
-      adapter_mod =
-        case config.adapter do
-          :gun -> GRPC.Client.Adapters.Gun
-          :mint -> GRPC.Client.Adapters.Mint
-        end
+      adapter_opts = [http2_opts: %{settings_timeout: :infinity}]
 
       base_opts = [
-        adapter: adapter_mod,
+        adapter: config.adapter,
         headers: [{"authorization", "Bearer #{token}"}],
-        adapter_opts: [http2_opts: %{settings_timeout: :infinity}]
+        adapter_opts: adapter_opts
       ]
 
       opts =

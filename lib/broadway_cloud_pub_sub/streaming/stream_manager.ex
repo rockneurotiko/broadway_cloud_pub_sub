@@ -349,7 +349,21 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   # Server closed the stream normally (StreamReader enumeration exhausted)
   def handle_info({:stream_closed}, state) do
     emit_telemetry(:disconnect, %{reason: :stream_closed}, state.config)
-    {:noreply, schedule_reconnect(reset_connection(state, :stream_closed))}
+
+    # The stream ended naturally: the Mint ConnectionProcess already called
+    # StreamResponseProcess.done/1 and popped the request_ref from its state
+    # when it received the HTTP/2 END_STREAM frame.  Calling GRPC.Stub.cancel
+    # now would make the ConnectionProcess try to send :done to the
+    # already-stopped StreamResponseProcess, crashing the ConnectionProcess.
+    # Nil out grpc_stream so close_stream/1 skips the cancel for this case.
+    state = %{state | grpc_stream: nil}
+
+    if state.draining do
+      # Mid-drain: do not open a new stream; just clean up reader/channel.
+      {:noreply, reset_connection(state, :stream_closed)}
+    else
+      {:noreply, schedule_reconnect(reset_connection(state, :stream_closed))}
+    end
   end
 
   # StreamReader process exited normally — stream ended cleanly.
@@ -359,7 +373,15 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   def handle_info({:EXIT, pid, :normal}, %{reader_pid: pid} = state) do
     if state.grpc_stream do
       emit_telemetry(:disconnect, %{reason: :stream_closed}, state.config)
-      {:noreply, schedule_reconnect(reset_connection(state, :stream_closed))}
+
+      # Same rationale as {:stream_closed}: stream ended naturally, skip cancel.
+      state = %{state | grpc_stream: nil}
+
+      if state.draining do
+        {:noreply, reset_connection(state, :stream_closed)}
+      else
+        {:noreply, schedule_reconnect(reset_connection(state, :stream_closed))}
+      end
     else
       # Already handled by {:stream_closed} — just clear the reader_pid
       {:noreply, %{state | reader_pid: nil}}
@@ -582,6 +604,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     with {:ok, token} <- fetch_token(config),
          {:ok, channel} <- open_channel(config, token) do
       connect_stream(channel, state)
+    else
+      {:error, reason} -> {:error, reason, state}
     end
   rescue
     e ->
@@ -616,18 +640,20 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
          %{grpc_endpoint: endpoint, use_ssl: use_ssl, adapter: adapter} = config,
          token
        ) do
-    adapter_mod =
-      case adapter do
-        :gun -> GRPC.Client.Adapters.Gun
-        :mint -> GRPC.Client.Adapters.Mint
-      end
-
     keepalive_interval_ms = Map.get(config, :keepalive_interval_ms, 30_000)
 
+    adapter_opts = [http2_opts: %{keepalive: keepalive_interval_ms, settings_timeout: :infinity}]
+
+    adapter_opts =
+      case Map.get(config, :test_pid) do
+        nil -> adapter_opts
+        pid -> Keyword.put(adapter_opts, :test_pid, pid)
+      end
+
     base_opts = [
-      adapter: adapter_mod,
+      adapter: adapter,
       headers: [{"authorization", "Bearer #{token}"}],
-      adapter_opts: [http2_opts: %{keepalive: keepalive_interval_ms, settings_timeout: :infinity}]
+      adapter_opts: adapter_opts
     ]
 
     opts =
@@ -691,10 +717,27 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     end
 
     if grpc_stream do
-      try do
-        GRPC.Stub.cancel(grpc_stream)
-      catch
-        _, _ -> :ok
+      # Guard against cancelling a stream whose StreamResponseProcess is already
+      # dead. The Mint ConnectionProcess calls StreamResponseProcess.done/1
+      # (a synchronous GenServer.call) as part of handling {:cancel_request, ...}.
+      # If the StreamResponseProcess is already gone — because the reader was killed
+      # and the linked SRP died with it — the ConnectionProcess crashes with
+      # "no process" even though our try/catch protects the StreamManager.
+      # Checking liveness first lets us skip the cancel when there's nothing to
+      # cancel safely. For Gun-based streams, payload.stream_response_pid is nil
+      # so the guard is always true there.
+      srp_alive? =
+        case grpc_stream do
+          %{payload: %{stream_response_pid: pid}} when is_pid(pid) -> Process.alive?(pid)
+          _ -> true
+        end
+
+      if srp_alive? do
+        try do
+          GRPC.Stub.cancel(grpc_stream)
+        catch
+          _, _ -> :ok
+        end
       end
     end
 

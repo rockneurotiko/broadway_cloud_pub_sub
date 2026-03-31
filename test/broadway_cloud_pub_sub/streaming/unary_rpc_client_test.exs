@@ -2,6 +2,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClientTest do
   use ExUnit.Case, async: true
 
   alias BroadwayCloudPubSub.Streaming.UnaryRpcClient
+  alias BroadwayCloudPubSub.Test.GrpcDynamicAdapter
 
   # ============================================================
   # Chunking logic — pure caller-side, no GenServer needed
@@ -46,8 +47,8 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClientTest do
       broadway_name: __MODULE__,
       subscription: "projects/test/subscriptions/test-sub",
       token_generator: {__MODULE__, :fail_token, []},
-      adapter: :gun,
-      grpc_endpoint: "pubsub.googleapis.com:443",
+      adapter: GrpcDynamicAdapter,
+      grpc_endpoint: "localhost:12345",
       use_ssl: false,
       backoff_type: :exp,
       backoff_min: 100,
