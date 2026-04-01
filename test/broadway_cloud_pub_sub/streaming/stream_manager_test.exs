@@ -375,7 +375,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         end)
 
       assert logs =~
-               "Terminal Cloud Pub/Sub gRPC error — stopping: %GRPC.RPCError{status: 5, message: \"not found\", details: nil}"
+               "Terminal gRPC stream error on subscription projects/test/subscriptions/test-sub - reason: %GRPC.RPCError{status: 5, message: \"not found\", details: nil}. Stopping StreamManager."
     end
 
     test "PERMISSION_DENIED (7) stops the GenServer" do
@@ -391,7 +391,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         end)
 
       assert logs =~
-               "Terminal Cloud Pub/Sub gRPC error — stopping: %GRPC.RPCError{status: 7, message: \"permission denied\", details: nil}"
+               "Terminal gRPC stream error on subscription projects/test/subscriptions/test-sub - reason: %GRPC.RPCError{status: 7, message: \"permission denied\", details: nil}. Stopping StreamManager."
     end
 
     test "INVALID_ARGUMENT (3) stops the GenServer" do
@@ -407,7 +407,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         end)
 
       assert logs =~
-               "Terminal Cloud Pub/Sub gRPC error — stopping: %GRPC.RPCError{status: 3, message: \"bad argument\", details: nil}"
+               "Terminal gRPC stream error on subscription projects/test/subscriptions/test-sub - reason: %GRPC.RPCError{status: 3, message: \"bad argument\", details: nil}. Stopping StreamManager."
     end
 
     test "UNAUTHENTICATED (16) schedules reconnect without stopping" do
@@ -468,7 +468,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         end)
 
       assert logs =~
-               "Terminal Cloud Pub/Sub gRPC error — stopping: %GRPC.RPCError{status: 5, message: \"not found\", details: nil}"
+               "Terminal gRPC stream error on subscription projects/test/subscriptions/test-sub - reason: %GRPC.RPCError{status: 5, message: \"not found\", details: nil}. Stopping StreamManager."
     end
   end
 
@@ -843,6 +843,505 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       # which triggers a new connect — we just verify the process survives
       # and the test doesn't hang.
       Process.sleep(100)
+    end
+  end
+
+  # ============================================================
+  # Exactly-once delivery — receipt modack gate
+  # ============================================================
+
+  # A spy RPC client for use in exactly-once tests. It records calls and allows
+  # the test to control the response by sending {:set_modack_response, result}.
+  defmodule SpyRpcClientForEO do
+    use GenServer
+
+    def start_link(test_pid) do
+      GenServer.start_link(__MODULE__, test_pid)
+    end
+
+    def init(test_pid), do: {:ok, %{test_pid: test_pid, next_response: :ok}}
+
+    def handle_call({:modify_ack_deadline, ids, deadline}, _from, state) do
+      send(state.test_pid, {:rpc_call, {:modack, ids, deadline}})
+      result = if state.next_response == :ok, do: :ok, else: state.next_response
+      {:reply, result, %{state | next_response: :ok}}
+    end
+
+    def handle_call({:acknowledge, _ids}, _from, state) do
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:ping, _from, state), do: {:reply, :ok, state}
+
+    # Synchronous setter so callers can guarantee the response is set before
+    # any concurrent Task fires the next RPC call.
+    def handle_call({:set_response_sync, response}, _from, state) do
+      {:reply, :ok, %{state | next_response: response}}
+    end
+
+    def handle_cast({:set_response, response}, state) do
+      {:noreply, %{state | next_response: response}}
+    end
+  end
+
+  # Start a StreamManager backed by a SpyRpcClientForEO so we can control
+  # RPC responses for exactly-once tests.
+  defp start_manager_with_spy_rpc(extra_opts \\ []) do
+    broadway_name = Module.concat(__MODULE__, "EORun#{System.unique_integer([:positive])}")
+
+    opts =
+      base_config()
+      |> Keyword.put(:broadway_name, broadway_name)
+      |> Keyword.merge(extra_opts)
+
+    rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
+    batcher_name = Module.concat(broadway_name, AckBatcher)
+
+    test_pid = self()
+    {:ok, rpc_pid} = SpyRpcClientForEO.start_link(test_pid)
+    # Register under the name AckBatcher will use
+    Process.register(rpc_pid, rpc_client_name)
+
+    {:ok, _batcher} =
+      AckBatcher.start_link(
+        name: batcher_name,
+        rpc_client: rpc_client_name,
+        ack_batch_interval_ms: Keyword.get(opts, :ack_batch_interval_ms, 50),
+        ack_batch_max_size: Keyword.get(opts, :ack_batch_max_size, 2_500)
+      )
+
+    {:ok, pid} = StreamManager.start_link(opts)
+    StreamManager.set_producer(pid, self())
+
+    {pid, rpc_pid}
+  end
+
+  # Enable exactly-once delivery on a running StreamManager
+  defp enable_exactly_once(pid) do
+    send(
+      pid,
+      {:subscription_properties,
+       %Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties{
+         message_ordering_enabled: false,
+         exactly_once_delivery_enabled: true
+       }}
+    )
+
+    sync(pid)
+  end
+
+  describe "exactly-once receipt modack gate — {:stream_messages, ...}" do
+    test "in exactly-once mode, messages are NOT immediately forwarded to producer" do
+      {pid, _rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("eo-ack-1", "data")]})
+      sync(pid)
+
+      # Receipt modack RPC is in-flight; message not yet delivered
+      refute_received {:stream_messages, _}
+
+      # State has one pending entry
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 1
+    end
+
+    test "in standard mode, messages are forwarded immediately (no gating)" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("std-ack-1", "data")]})
+
+      assert_receive {:stream_messages, [msg]}, 500
+      assert msg.data == "data"
+
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 0
+    end
+
+    test "messages are added to outstanding after receipt modack succeeds" do
+      {pid, _rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("eo-ack-2", "data")]})
+      sync(pid)
+
+      state_before = :sys.get_state(pid)
+      [ref] = Map.keys(state_before.pending_receipt_modacks)
+
+      # Simulate receipt modack success
+      send(pid, {:receipt_modack_result, ref, {:ok, []}})
+      sync(pid)
+
+      state_after = :sys.get_state(pid)
+      assert map_size(state_after.pending_receipt_modacks) == 0
+      assert Map.has_key?(state_after.outstanding, "eo-ack-2")
+    end
+  end
+
+  # Injects a pending_receipt_modacks entry into StreamManager state directly,
+  # bypassing the AckBatcher/Task chain. Used for tests that need to control
+  # which receipt_modack_result variant the handler sees.
+  defp inject_pending_receipt_modack(pid, ref, ack_ids, data_by_id) do
+    broadway_msgs =
+      Enum.map(ack_ids, fn ack_id ->
+        %Broadway.Message{
+          data: Map.get(data_by_id, ack_id, ack_id),
+          metadata: %{},
+          acknowledger: BroadwayCloudPubSub.Streaming.Acknowledger.builder(__MODULE__).(ack_id)
+        }
+      end)
+
+    :sys.replace_state(pid, fn s ->
+      entry = %{
+        broadway_messages: broadway_msgs,
+        ack_ids: ack_ids,
+        received_at: System.monotonic_time(:millisecond)
+      }
+
+      %{s | pending_receipt_modacks: Map.put(s.pending_receipt_modacks, ref, entry)}
+    end)
+  end
+
+  describe "exactly-once — {:receipt_modack_result, ref, result}" do
+    test "total success: all messages delivered and added to outstanding" do
+      # SpyRpcClientForEO defaults to :ok, so the Task auto-fires {:ok, []} result.
+      {pid, _rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("r1", "d1"), received_message("r2", "d2")]})
+
+      # The Task fires the RPC and sends back {:receipt_modack_result, ref, {:ok, []}}
+      # automatically. Wait for the resulting message delivery.
+      assert_receive {:stream_messages, msgs}, 500
+      assert length(msgs) == 2
+      assert Enum.map(msgs, & &1.data) |> Enum.sort() == ["d1", "d2"]
+
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 0
+      assert Map.has_key?(state.outstanding, "r1")
+      assert Map.has_key?(state.outstanding, "r2")
+    end
+
+    test "total failure: no messages delivered, nothing added to outstanding" do
+      {pid, rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      # Configure spy synchronously to return {:error, :unavailable} for the next modack call
+      :ok = GenServer.call(rpc, {:set_response_sync, {:error, :unavailable}})
+
+      send(pid, {:stream_messages, [received_message("fail-1", "data")]})
+      # Wait for the Task's RPC call to complete and result to be processed
+      sync(pid)
+      # Give extra time for the async Task result to arrive and be processed
+      Process.sleep(200)
+      sync(pid)
+
+      refute_received {:stream_messages, _}
+
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 0
+      assert map_size(state.outstanding) == 0
+    end
+
+    test "partial success: only succeeded messages delivered, failed dropped" do
+      # Inject the pending entry directly to avoid racing with the auto-Task.
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      ref = make_ref()
+
+      inject_pending_receipt_modack(pid, ref, ["ok-id", "bad-id"], %{
+        "ok-id" => "good",
+        "bad-id" => "dropped"
+      })
+
+      send(pid, {:receipt_modack_result, ref, {:ok, ["bad-id"]}})
+
+      assert_receive {:stream_messages, msgs}, 500
+      assert length(msgs) == 1
+      assert hd(msgs).data == "good"
+
+      state = :sys.get_state(pid)
+      assert Map.has_key?(state.outstanding, "ok-id")
+      refute Map.has_key?(state.outstanding, "bad-id")
+    end
+
+    test "partial success with all failed: no messages delivered" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["all-bad"], %{"all-bad" => "data"})
+
+      send(pid, {:receipt_modack_result, ref, {:ok, ["all-bad"]}})
+      sync(pid)
+
+      refute_received {:stream_messages, _}
+      assert map_size(:sys.get_state(pid).outstanding) == 0
+    end
+
+    test "stale/unknown ref is ignored gracefully" do
+      {pid, _rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+
+      stale_ref = make_ref()
+      send(pid, {:receipt_modack_result, stale_ref, {:ok, []}})
+      sync(pid)
+
+      assert Process.alive?(pid)
+      assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 0
+    end
+  end
+
+  describe "exactly-once — retry deadline auto-switch" do
+    test "AckBatcher retry_deadline_ms switches to 600s when exactly-once is enabled" do
+      broadway_name = Module.concat(__MODULE__, "RD#{System.unique_integer([:positive])}")
+
+      opts =
+        base_config()
+        |> Keyword.put(:broadway_name, broadway_name)
+        |> Keyword.put(:retry_deadline_ms, 60_000)
+
+      rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
+      batcher_name = Module.concat(broadway_name, AckBatcher)
+
+      {:ok, _stub} = StubRpcClient.start_link(rpc_client_name)
+
+      {:ok, _batcher} =
+        AckBatcher.start_link(
+          name: batcher_name,
+          rpc_client: rpc_client_name,
+          ack_batch_interval_ms: 100,
+          ack_batch_max_size: 2_500,
+          retry_deadline_ms: 60_000
+        )
+
+      {:ok, pid} = StreamManager.start_link(opts)
+      StreamManager.set_producer(pid, self())
+
+      batcher_pid = Process.whereis(batcher_name)
+      assert :sys.get_state(batcher_pid).retry_deadline_ms == 60_000
+
+      # Enable exactly-once
+      send(
+        pid,
+        {:subscription_properties,
+         %Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties{
+           message_ordering_enabled: false,
+           exactly_once_delivery_enabled: true
+         }}
+      )
+
+      sync(pid)
+      # Cast is async — let AckBatcher process it
+      AckBatcher.flush(batcher_pid)
+
+      assert :sys.get_state(batcher_pid).retry_deadline_ms == 600_000
+    end
+
+    test "AckBatcher retry_deadline_ms is restored to configured value when exactly-once is disabled" do
+      broadway_name = Module.concat(__MODULE__, "RD2#{System.unique_integer([:positive])}")
+
+      opts =
+        base_config()
+        |> Keyword.put(:broadway_name, broadway_name)
+        |> Keyword.put(:retry_deadline_ms, 60_000)
+
+      rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
+      batcher_name = Module.concat(broadway_name, AckBatcher)
+
+      {:ok, _stub} = StubRpcClient.start_link(rpc_client_name)
+
+      {:ok, _batcher} =
+        AckBatcher.start_link(
+          name: batcher_name,
+          rpc_client: rpc_client_name,
+          ack_batch_interval_ms: 100,
+          ack_batch_max_size: 2_500,
+          retry_deadline_ms: 60_000
+        )
+
+      {:ok, pid} = StreamManager.start_link(opts)
+      StreamManager.set_producer(pid, self())
+
+      batcher_pid = Process.whereis(batcher_name)
+
+      enable_exactly_once(pid)
+      AckBatcher.flush(batcher_pid)
+      assert :sys.get_state(batcher_pid).retry_deadline_ms == 600_000
+
+      # Disable exactly-once
+      send(
+        pid,
+        {:subscription_properties,
+         %Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties{
+           message_ordering_enabled: false,
+           exactly_once_delivery_enabled: false
+         }}
+      )
+
+      sync(pid)
+      AckBatcher.flush(batcher_pid)
+      assert :sys.get_state(batcher_pid).retry_deadline_ms == 60_000
+    end
+
+    test "retry_deadline_ms is NOT updated when exactly_once status does not change" do
+      broadway_name = Module.concat(__MODULE__, "RD3#{System.unique_integer([:positive])}")
+
+      opts =
+        base_config()
+        |> Keyword.put(:broadway_name, broadway_name)
+        |> Keyword.put(:retry_deadline_ms, 60_000)
+
+      rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
+      batcher_name = Module.concat(broadway_name, AckBatcher)
+
+      {:ok, _stub} = StubRpcClient.start_link(rpc_client_name)
+
+      {:ok, _batcher} =
+        AckBatcher.start_link(
+          name: batcher_name,
+          rpc_client: rpc_client_name,
+          ack_batch_interval_ms: 100,
+          ack_batch_max_size: 2_500
+        )
+
+      {:ok, pid} = StreamManager.start_link(opts)
+      StreamManager.set_producer(pid, self())
+
+      batcher_pid = Process.whereis(batcher_name)
+      initial_deadline = :sys.get_state(batcher_pid).retry_deadline_ms
+
+      # Send the same exactly_once=false twice — no update should happen
+      send(
+        pid,
+        {:subscription_properties,
+         %Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties{
+           message_ordering_enabled: false,
+           exactly_once_delivery_enabled: false
+         }}
+      )
+
+      sync(pid)
+      AckBatcher.flush(batcher_pid)
+
+      assert :sys.get_state(batcher_pid).retry_deadline_ms == initial_deadline
+    end
+  end
+
+  describe "exactly-once — stale pending_receipt_modacks sweep" do
+    test "entries older than 60s are nacked with deadline=0 during extend_leases" do
+      pid = start_manager()
+
+      # Inject a stale entry (received_at far in the past)
+      stale_ref = make_ref()
+
+      stale_entry = %{
+        broadway_messages: [],
+        ack_ids: ["stale-ack-1"],
+        received_at: System.monotonic_time(:millisecond) - 120_000
+      }
+
+      :sys.replace_state(pid, fn s ->
+        %{s | pending_receipt_modacks: Map.put(s.pending_receipt_modacks, stale_ref, stale_entry)}
+      end)
+
+      # Trigger extend_leases which runs the sweep
+      send(pid, :extend_leases)
+      sync(pid)
+
+      # Stale entry should be removed
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.pending_receipt_modacks, stale_ref)
+    end
+
+    test "fresh entries are NOT swept during extend_leases" do
+      pid = start_manager()
+
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["fresh-ack"], %{"fresh-ack" => "data"})
+
+      send(pid, :extend_leases)
+      sync(pid)
+
+      # Fresh entry should survive the sweep
+      assert Map.has_key?(:sys.get_state(pid).pending_receipt_modacks, ref)
+    end
+  end
+
+  describe "exactly-once — drain nack pending receipt modacks" do
+    test "pending receipt modacks are nacked on stop_receiving" do
+      pid = start_manager()
+
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["drain-eo"], %{"drain-eo" => "data"})
+      assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 1
+
+      StreamManager.stop_receiving(pid)
+      sync(pid)
+
+      # After drain, pending_receipt_modacks should be cleared
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 0
+    end
+
+    test "receipt_modack_result after drain (cleared pending) is ignored gracefully" do
+      pid = start_manager()
+
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["drain-stale"], %{"drain-stale" => "data"})
+
+      # Drain clears the pending map
+      StreamManager.stop_receiving(pid)
+      sync(pid)
+
+      # RPC result arrives after drain — should be ignored, not crash
+      send(pid, {:receipt_modack_result, ref, {:ok, []}})
+      sync(pid)
+
+      assert Process.alive?(pid)
+    end
+  end
+
+  describe "exactly-once — pending_receipt_modacks NOT cleared on reconnect" do
+    test "pending_receipt_modacks survives a stream_error reset" do
+      # Use inject_pending_receipt_modack to avoid races with the auto-Task.
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["reconnect-ack"], %{"reconnect-ack" => "data"})
+      assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 1
+
+      # Simulate a retryable stream error (triggers reconnect, not drain)
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+      sync(pid)
+
+      # pending_receipt_modacks must survive — ack_ids are valid across reconnects
+      assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 1
+    end
+
+    test "receipt_modack_result arriving after reconnect is still processed correctly" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["post-reconnect"], %{"post-reconnect" => "data"})
+
+      # Reconnect
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+      sync(pid)
+
+      # Result arrives post-reconnect — should still deliver
+      send(pid, {:receipt_modack_result, ref, {:ok, []}})
+
+      assert_receive {:stream_messages, [msg]}, 500
+      assert msg.data == "data"
     end
   end
 end

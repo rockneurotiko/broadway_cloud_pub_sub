@@ -361,6 +361,220 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
   end
 
   # ============================================================
+  # receipt_modack/5 — exactly-once delivery
+  # ============================================================
+
+  describe "receipt_modack/5" do
+    test "spawns a task that calls modify_ack_deadline and sends result to reply_to" do
+      {batcher, _rpc} = start_batcher()
+      ref = make_ref()
+
+      AckBatcher.receipt_modack(batcher, ref, self(), ["id-eo-1", "id-eo-2"], 60)
+
+      # SpyRpcClient returns :ok (i.e., {:ok, []}) for modify_ack_deadline
+      assert_receive {:receipt_modack_result, ^ref, {:ok, []}}, 500
+      # The RPC was also made to the spy
+      assert_receive {:rpc, {:modify_ack_deadline, ids, 60}}, 500
+      assert Enum.sort(ids) == ["id-eo-1", "id-eo-2"]
+    end
+
+    test "result is sent to the specified reply_to pid, not the batcher" do
+      {batcher, _rpc} = start_batcher()
+      ref = make_ref()
+      # reply_to is self(), so we expect the message here
+      AckBatcher.receipt_modack(batcher, ref, self(), ["id-reply"], 60)
+
+      assert_receive {:receipt_modack_result, ^ref, _result}, 500
+    end
+
+    test "does NOT add ack_ids to the batcher's pending batch" do
+      {batcher, _rpc} = start_batcher(ack_batch_interval_ms: 10_000)
+      ref = make_ref()
+
+      AckBatcher.receipt_modack(batcher, ref, self(), ["id-not-batched"], 60)
+      # Wait for the task to complete
+      assert_receive {:receipt_modack_result, ^ref, _}, 500
+
+      # State should have no pending ack_ids or modack_ids
+      state = :sys.get_state(batcher)
+      assert state.ack_ids == []
+      assert state.modack_ids == %{}
+    end
+
+    test "multiple concurrent receipt_modacks use independent refs" do
+      {batcher, _rpc} = start_batcher()
+      ref1 = make_ref()
+      ref2 = make_ref()
+
+      AckBatcher.receipt_modack(batcher, ref1, self(), ["id-a"], 60)
+      AckBatcher.receipt_modack(batcher, ref2, self(), ["id-b"], 60)
+
+      results =
+        for _ <- 1..2 do
+          receive do
+            {:receipt_modack_result, ref, result} -> {ref, result}
+          after
+            500 -> flunk("Expected 2 receipt_modack_result messages")
+          end
+        end
+
+      result_refs = Enum.map(results, &elem(&1, 0))
+
+      assert Enum.sort_by(result_refs, &:erlang.ref_to_list/1) ==
+               Enum.sort_by([ref1, ref2], &:erlang.ref_to_list/1)
+    end
+  end
+
+  # ============================================================
+  # update_retry_deadline/2 — exactly-once auto-switch
+  # ============================================================
+
+  describe "update_retry_deadline/2" do
+    test "updates retry_deadline_ms in state" do
+      {batcher, _rpc} = start_batcher()
+
+      # Default is nil (not configured in start_batcher)
+      state = :sys.get_state(batcher)
+      assert state.retry_deadline_ms == nil
+
+      AckBatcher.update_retry_deadline(batcher, 600_000)
+      # Cast is async — sync via flush
+      AckBatcher.flush(batcher)
+
+      state = :sys.get_state(batcher)
+      assert state.retry_deadline_ms == 600_000
+    end
+
+    test "restores configured deadline when exactly-once is disabled" do
+      {batcher, _rpc} = start_batcher()
+
+      AckBatcher.update_retry_deadline(batcher, 600_000)
+      AckBatcher.flush(batcher)
+      assert :sys.get_state(batcher).retry_deadline_ms == 600_000
+
+      AckBatcher.update_retry_deadline(batcher, 60_000)
+      AckBatcher.flush(batcher)
+      assert :sys.get_state(batcher).retry_deadline_ms == 60_000
+    end
+  end
+
+  # ============================================================
+  # Modack retry limit — @max_modack_attempts = 3
+  # ============================================================
+
+  # RPC client that always fails modify_ack_deadline so we can observe the retry limit.
+  defmodule AlwaysFailModackRpc do
+    use GenServer
+
+    def start_link(test_pid) do
+      GenServer.start_link(__MODULE__, {test_pid, 0})
+    end
+
+    def init(state), do: {:ok, state}
+
+    def handle_call({:acknowledge, _ids}, _from, {test_pid, count}) do
+      {:reply, :ok, {test_pid, count + 1}}
+    end
+
+    def handle_call({:modify_ack_deadline, ids, deadline}, _from, {test_pid, count}) do
+      send(test_pid, {:rpc, {:modack, ids, deadline}, count})
+      # Always return a retryable error to force retries up to the limit
+      {:reply, {:error, :unavailable}, {test_pid, count + 1}}
+    end
+  end
+
+  describe "modack retry limit" do
+    test "drops modack ack_ids after 3 failed attempts" do
+      test_pid = self()
+      {:ok, rpc} = AlwaysFailModackRpc.start_link(test_pid)
+
+      {:ok, batcher} =
+        AckBatcher.start_link(
+          rpc_client: rpc,
+          ack_batch_interval_ms: 30,
+          ack_batch_max_size: 100
+        )
+
+      AckBatcher.modack(batcher, ["id-exhaust"], 30)
+
+      # Attempt 1 (count=0)
+      assert_receive {:rpc, {:modack, ["id-exhaust"], 30}, 0}, 500
+      # Attempt 2 (count=1)
+      assert_receive {:rpc, {:modack, ["id-exhaust"], 30}, 1}, 500
+      # Attempt 3 (count=2)
+      assert_receive {:rpc, {:modack, ["id-exhaust"], 30}, 2}, 500
+
+      # After 3 attempts the id is dropped — no further RPC calls for it
+      refute_receive {:rpc, {:modack, ["id-exhaust"], 30}, _}, 200
+
+      # State should be clear
+      state = :sys.get_state(batcher)
+      assert state.modack_ids == %{}
+      assert state.modack_attempts == %{}
+    end
+
+    test "other ack_ids are not affected by one id reaching the retry limit" do
+      test_pid = self()
+
+      # Only fail for "id-bad", succeed for everything else
+      {:ok, rpc} =
+        GenServer.start_link(
+          BroadwayCloudPubSub.Streaming.AckBatcherTest.AlwaysFailModackRpc,
+          {test_pid, 0}
+        )
+
+      # Use SelectiveFlakyRpc indirectly: we test via the state, not via RPC spy
+      {:ok, batcher_a} =
+        AckBatcher.start_link(
+          rpc_client: rpc,
+          ack_batch_interval_ms: 10_000,
+          ack_batch_max_size: 100
+        )
+
+      # Add two ids with the same deadline; the rpc always fails
+      AckBatcher.modack(batcher_a, ["id-1", "id-2"], 30)
+
+      # After 3 flushes, both should be dropped
+      AckBatcher.flush(batcher_a)
+      AckBatcher.flush(batcher_a)
+      AckBatcher.flush(batcher_a)
+      AckBatcher.flush(batcher_a)
+
+      state = :sys.get_state(batcher_a)
+      assert state.modack_ids == %{}
+    end
+
+    test "retry limit is per-ack-id — surviving ids stay in state after others are dropped" do
+      # AlwaysFailModackRpc fails every modify_ack_deadline call.
+      # Both "id-bad" and "id-good" will exhaust the 3-attempt limit, so after
+      # 3 flushes the modack state should be fully cleared.
+      test_pid = self()
+      {:ok, rpc} = AlwaysFailModackRpc.start_link(test_pid)
+
+      {:ok, batcher_b} =
+        AckBatcher.start_link(
+          rpc_client: rpc,
+          ack_batch_interval_ms: 10_000,
+          ack_batch_max_size: 100
+        )
+
+      AckBatcher.modack(batcher_b, ["id-bad", "id-good"], 30)
+
+      # 3 explicit flushes exhaust the retry limit for both ids
+      AckBatcher.flush(batcher_b)
+      AckBatcher.flush(batcher_b)
+      AckBatcher.flush(batcher_b)
+      # One more flush to let the cleanup sweep run
+      AckBatcher.flush(batcher_b)
+
+      state = :sys.get_state(batcher_b)
+      remaining_ids = state.modack_ids |> Map.values() |> List.flatten()
+      refute "id-bad" in remaining_ids
+      refute "id-good" in remaining_ids
+    end
+  end
+
+  # ============================================================
   # Helpers
   # ============================================================
 

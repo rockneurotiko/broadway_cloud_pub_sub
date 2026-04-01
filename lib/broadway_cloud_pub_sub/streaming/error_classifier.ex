@@ -30,7 +30,21 @@ defmodule BroadwayCloudPubSub.Streaming.ErrorClassifier do
   #   - NOT_FOUND (5)         — subscription does not exist
   #   - PERMISSION_DENIED (7) — service account lacks Subscriber role
   #   - INVALID_ARGUMENT (3)  — bad subscription name or flow-control params
-  #   - CANCELLED (1)         — deliberate cancellation (not self-initiated)
+  #   - FAILED_PRECONDITION (9)— subscription in wrong state (e.g. detached or
+  #                             seeking). Reconnecting without a config change
+  #                             will not resolve the condition.
+  #
+  # CANCELLED (1) is classified as **retryable** because in practice it occurs
+  # in two benign scenarios:
+  #
+  #   1. Server-side stream teardown — the server cancels the stream during load
+  #      balancing or backend rotation.  Reconnecting immediately succeeds.
+  #   2. Client-side stream replacement — some libraries (Node.js) cancel a
+  #      stream to open a fresh one.  The cancellation is expected, not terminal.
+  #
+  # During graceful shutdown the StreamReader is killed before any CANCELLED
+  # error can be forwarded, so a retryable classification does not cause an
+  # unwanted reconnect during drain.
 
   @terminal_status_codes MapSet.new([
                            # NOT_FOUND — subscription does not exist
@@ -39,8 +53,8 @@ defmodule BroadwayCloudPubSub.Streaming.ErrorClassifier do
                            7,
                            # INVALID_ARGUMENT — bad config / subscription name
                            3,
-                           # CANCELLED — external cancellation (self-cancellation is handled separately)
-                           1
+                           # FAILED_PRECONDITION — subscription in wrong state
+                           9
                          ])
 
   @type classification :: :retryable | :terminal

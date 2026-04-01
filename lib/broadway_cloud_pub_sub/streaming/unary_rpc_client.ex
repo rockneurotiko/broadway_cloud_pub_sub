@@ -159,20 +159,26 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
           ack_ids: ack_ids
         }
 
-        case Subscriber.Stub.acknowledge(channel, request, timeout: 30_000) do
+        result =
+          :telemetry.span(
+            [:broadway_cloud_pub_sub, :unary, :ack],
+            %{name: state.config.broadway_name, subscription: state.config.subscription},
+            fn ->
+              {Subscriber.Stub.acknowledge(channel, request, timeout: 30_000),
+               %{count: length(ack_ids)}}
+            end
+          )
+
+        case result do
           {:ok, _} ->
-            emit_telemetry(:ack, %{count: length(ack_ids)}, state.config)
             {:reply, :ok, state}
 
           {:error, error} ->
             case ErrorClassifier.classify(error) do
               :retryable ->
-                # Parse per-ack-ID errors from the gRPC error details.
-                # For exactly-once subscriptions, the server can return a
-                # retryable RPC error that contains per-ack-ID permanent
-                # failures embedded in google.rpc.ErrorInfo details.
-                # Permanent failures are dropped; transient ones are returned
-                # to AckBatcher for retry on the next flush.
+                # For exactly-once subscriptions, retryable RPC errors may embed
+                # per-ack-ID permanent failures in error details. Permanent ids
+                # are dropped; transient ones are returned to AckBatcher for retry.
                 per_ack_errors = AckResult.parse_error_details(Map.get(error, :details))
                 {transient_ids, permanent_ids} = split_by_ack_result(ack_ids, per_ack_errors)
 
@@ -195,7 +201,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
 
               :terminal ->
                 Logger.error(
-                  "[UnaryRpcClient] Terminal error on ack (#{length(ack_ids)} ids): #{inspect(error)}"
+                  "Unable to acknowledge messages with Cloud Pub/Sub via gRPC - reason: #{inspect(error)}"
                 )
 
                 # Reply first so caller can retain ack_ids, then stop so supervisor restarts fresh.
@@ -219,9 +225,18 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
           ack_deadline_seconds: deadline_seconds
         }
 
-        case Subscriber.Stub.modify_ack_deadline(channel, request, timeout: 30_000) do
+        result =
+          :telemetry.span(
+            [:broadway_cloud_pub_sub, :unary, :modack],
+            %{name: state.config.broadway_name, subscription: state.config.subscription},
+            fn ->
+              {Subscriber.Stub.modify_ack_deadline(channel, request, timeout: 30_000),
+               %{count: length(ack_ids)}}
+            end
+          )
+
+        case result do
           {:ok, _} ->
-            emit_telemetry(:modack, %{count: length(ack_ids)}, state.config)
             {:reply, :ok, state}
 
           {:error, error} ->
@@ -249,7 +264,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
 
               :terminal ->
                 Logger.error(
-                  "[UnaryRpcClient] Terminal error on modack (#{length(ack_ids)} ids, deadline=#{deadline_seconds}s): #{inspect(error)}"
+                  "Unable to modify ack deadline for messages with Cloud Pub/Sub via gRPC - reason: #{inspect(error)}"
                 )
 
                 {:stop, {:terminal_error, error}, {:error, error}, state}
@@ -279,13 +294,9 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
     end
   end
 
-  # The Mint/Gun ConnectionProcess spawned by GRPC.Stub.connect is linked to
-  # this GenServer. With trap_exit enabled (set in init/1), its normal exit on
-  # disconnect/shutdown is delivered here rather than killing us.
-  #
-  #   :normal   — peer disconnected cleanly; nil out the channel so
-  #               ensure_channel/1 will reopen it on the next request.
-  #   other     — unexpected crash; schedule a reconnect.
+  # The Mint/Gun ConnectionProcess is linked to this GenServer (trap_exit in init/1).
+  # :normal = clean disconnect; nil out channel so ensure_channel/1 reopens it.
+  # other   = unexpected crash; schedule a reconnect.
   def handle_info({:EXIT, _pid, :normal}, state) do
     {:noreply, %{state | channel: nil}}
   end
@@ -298,7 +309,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl GenServer
-  def terminate(_reason, %{channel: channel}) when not is_nil(channel) do
+  def terminate(_reason, %{channel: channel} = _state) when not is_nil(channel) do
     try do
       GRPC.Stub.disconnect(channel)
     catch

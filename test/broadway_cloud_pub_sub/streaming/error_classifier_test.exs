@@ -62,8 +62,14 @@ defmodule BroadwayCloudPubSub.Streaming.ErrorClassifierTest do
       assert ErrorClassifier.classify(rpc_error(3)) == :terminal
     end
 
-    test "CANCELLED (1) is terminal" do
-      assert ErrorClassifier.classify(rpc_error(1)) == :terminal
+    test "FAILED_PRECONDITION (9) is terminal" do
+      assert ErrorClassifier.classify(rpc_error(9)) == :terminal
+    end
+  end
+
+  describe "classify/1 — CANCELLED is retryable" do
+    test "CANCELLED (1) is retryable (server-side stream teardown or client replacement)" do
+      assert ErrorClassifier.classify(rpc_error(1)) == :retryable
     end
   end
 

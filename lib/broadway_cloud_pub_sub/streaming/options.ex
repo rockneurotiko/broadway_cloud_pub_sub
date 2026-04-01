@@ -160,15 +160,14 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       type: :pos_integer,
       default: 60_000,
       doc: """
-      Maximum total time in milliseconds that the unary RPC client (UnaryRpcClient)
-      will spend retrying a single acknowledge or modifyAckDeadline request before
-      giving up and dropping the ack_ids.
+      Maximum total time in milliseconds to keep retrying a failed acknowledge or
+      modifyAckDeadline request before giving up and dropping the ack_ids.
 
-      Each retry attempt uses jittered exponential backoff starting at 100ms and
-      capped at 60s. The default of 60,000ms (60 seconds) matches standard gax
-      retry behaviour. When exactly-once delivery is enabled (auto-detected from
-      subscription properties), this value should be increased to 600,000ms (600
-      seconds) to match the Go client's extended retry deadline for exactly-once acks.
+      The default of 60,000ms (60 seconds) applies to standard delivery subscriptions.
+      When exactly-once delivery is detected from subscription properties, the library
+      automatically switches to 600,000ms (600 seconds) to match the Go client's
+      extended retry deadline for exactly-once acks. The configured value is restored
+      if exactly-once delivery is later disabled on the subscription.
       """
     ],
     keepalive_interval_ms: [

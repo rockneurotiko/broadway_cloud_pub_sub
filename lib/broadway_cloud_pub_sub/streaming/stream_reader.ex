@@ -71,11 +71,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
     send(manager, {:stream_opened, self(), grpc_stream})
 
     case GRPC.Stub.recv(grpc_stream, timeout: :infinity) do
-      {:ok, enum} ->
-        enumerate(enum, manager)
-
-      {:error, error} ->
-        send(manager, {:stream_error, error})
+      {:ok, enum} -> enumerate(enum, manager)
+      {:error, error} -> send(manager, {:stream_error, error})
     end
   end
 
@@ -100,10 +97,9 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
     end)
     |> Stream.run()
 
-    # Stream exhausted normally — notify manager before exit.
-    # StreamManager will also receive {:EXIT, reader_pid, :normal} and
-    # schedule reconnect, but sending {:stream_closed} allows distinguishing
-    # normal closes from crashes in logs/telemetry.
+    # Stream exhausted normally — notify manager before exiting.
+    # Sending {:stream_closed} lets StreamManager distinguish normal closes
+    # from crashes before the {:EXIT, reader_pid, :normal} signal arrives.
     send(manager, {:stream_closed})
   end
 end

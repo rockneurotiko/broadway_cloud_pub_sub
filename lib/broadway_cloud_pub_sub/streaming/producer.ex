@@ -360,25 +360,21 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   def prepare_for_draining(state) do
     %{manager_pid: manager_pid, config: config} = state
 
-    # 1. Get buffered messages (not yet dispatched to processors) and nack them
-    #    immediately per on_shutdown config. These messages will be redelivered
-    #    by the server after the configured delay.
+    # Nack buffered messages (not yet dispatched to processors) per on_shutdown config.
     buffered = StreamManager.get_buffered(manager_pid)
 
     case {config[:on_shutdown], buffered} do
       {_, []} ->
         :ok
 
-      {:noop, _} ->
+      {:noop, _buffered_ids} ->
         :ok
 
       {{:nack, delay_seconds}, ack_ids} ->
         StreamManager.modify_deadline(manager_pid, ack_ids, delay_seconds)
     end
 
-    # 2. Stop receiving new messages and begin the drain phase. StreamManager
-    #    will close the reader, start a drain timer, and close the stream once
-    #    all outstanding (in-flight) messages have been acked/nacked.
+    # Stop receiving new messages and begin the drain phase.
     StreamManager.stop_receiving(manager_pid)
 
     {:noreply, [], %{state | draining: true}}
@@ -389,12 +385,9 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     %{manager_pid: manager_pid} = state
 
     if Process.alive?(manager_pid) do
-      # The drain phase in prepare_for_draining already handled buffered and
-      # outstanding messages. Just ensure the stream is closed cleanly.
       StreamManager.close(manager_pid)
     end
 
-    # Clean up persistent_term
     :persistent_term.erase(state.ack_ref)
 
     :ok

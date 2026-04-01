@@ -57,6 +57,15 @@ defmodule BroadwayCloudPubSub.MixProject do
       extras: [
         "README.md",
         "CHANGELOG.md"
+      ],
+      groups_for_modules: [
+        Pull: [
+          BroadwayCloudPubSub.Producer,
+          BroadwayCloudPubSub.Client
+        ],
+        Streaming: [
+          BroadwayCloudPubSub.Streaming.Producer
+        ]
       ]
     ]
   end
