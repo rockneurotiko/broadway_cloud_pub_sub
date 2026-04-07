@@ -257,6 +257,11 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
     broadway_name = broadway_opts[:name]
 
+    grpc_client = opts[:grpc_client]
+    {:ok, client_config} = grpc_client.init(opts)
+
+    opts = Keyword.put(opts, :grpc_client_config, client_config)
+
     # Config forwarded to UnaryRpcClient and AckBatcher via the supervisor.
     # These keys are a subset of the full opts — only what the unary path needs.
     unary_config =
@@ -272,8 +277,10 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
         :backoff_max,
         :ack_batch_interval_ms,
         :ack_batch_max_size,
-        :retry_deadline_ms
+        :retry_deadline_ms,
+        :grpc_client
       ])
+      |> Keyword.put(:grpc_client_config, client_config)
       |> Keyword.put(:broadway_name, broadway_name)
 
     sup_name = Module.concat(broadway_name, UnaryAckSupervisor)

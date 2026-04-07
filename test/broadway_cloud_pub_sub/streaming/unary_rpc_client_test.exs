@@ -63,6 +63,15 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClientTest do
 
   defp start_client_no_channel(extra_opts \\ []) do
     opts = Keyword.merge(base_config_bad_token(), extra_opts)
+    # Mirror what Producer.prepare_for_start/2 does: derive grpc_client_config.
+    grpc_client = Keyword.get(opts, :grpc_client, BroadwayCloudPubSub.Streaming.GrpcClient)
+    {:ok, grpc_client_config} = grpc_client.init(opts)
+
+    opts =
+      opts
+      |> Keyword.put(:grpc_client, grpc_client)
+      |> Keyword.put(:grpc_client_config, grpc_client_config)
+
     {:ok, pid} = UnaryRpcClient.start_link(opts)
     pid
   end
@@ -75,8 +84,9 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClientTest do
 
     test "registers under :name when provided" do
       name = Module.concat(__MODULE__, Named)
-      {:ok, _pid} = UnaryRpcClient.start_link(Keyword.put(base_config_bad_token(), :name, name))
+      pid = start_client_no_channel(name: name)
       assert Process.whereis(name) != nil
+      assert Process.alive?(pid)
     end
 
     test "channel is nil when initial token fetch fails" do

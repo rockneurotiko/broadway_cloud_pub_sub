@@ -37,6 +37,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   defstruct [
     :producer_pid,
     :config,
+    :grpc_client,
+    :grpc_client_config,
     :channel,
     :grpc_stream,
     :conn_pid,
@@ -178,6 +180,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     state = %__MODULE__{
       producer_pid: nil,
       config: config,
+      grpc_client: config.grpc_client,
+      grpc_client_config: config.grpc_client_config,
       backoff: backoff,
       ack_time_dist: AckTimeDistribution.new(config.stream_ack_deadline_seconds),
       ack_batcher: ack_batcher,
@@ -423,7 +427,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     adaptive_deadline = AckTimeDistribution.percentile(state.ack_time_dist, 0.99)
     keepalive_request = %StreamingPullRequest{stream_ack_deadline_seconds: adaptive_deadline}
 
-    case send_on_stream(state.grpc_stream, keepalive_request) do
+    case send_on_stream(state.grpc_stream, keepalive_request, state) do
       {:ok, stream} ->
         emit_telemetry(:keepalive, %{deadline: adaptive_deadline}, state.config)
         timer = schedule_keepalive_after(state.config)
@@ -573,12 +577,13 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   # --- Private: connection ---
 
-  defp connect(%{config: config} = state) do
-    with {:ok, token} <- fetch_token(config),
-         {:ok, channel} <- open_channel(config, token) do
-      connect_stream(channel, state)
-    else
-      {:error, reason} -> {:error, reason, state}
+  defp connect(state) do
+    case state.grpc_client.connect(state.grpc_client_config) do
+      {:ok, channel} ->
+        connect_stream(channel, state)
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   rescue
     e ->
@@ -600,56 +605,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     end
   rescue
     e ->
-      try do
-        GRPC.Stub.disconnect(channel)
-      catch
-        _, _ -> :ok
-      end
-
+      state.grpc_client.disconnect(channel, state.grpc_client_config)
       {:error, {:connect_failed, Exception.message(e)}, state}
   end
 
-  defp open_channel(
-         %{grpc_endpoint: endpoint, use_ssl: use_ssl, adapter: adapter} = config,
-         token
-       ) do
-    keepalive_interval_ms = Map.get(config, :keepalive_interval_ms, 30_000)
-
-    adapter_opts = [http2_opts: %{keepalive: keepalive_interval_ms, settings_timeout: :infinity}]
-
-    adapter_opts =
-      case Map.get(config, :test_pid) do
-        nil -> adapter_opts
-        pid -> Keyword.put(adapter_opts, :test_pid, pid)
-      end
-
-    base_opts = [
-      adapter: adapter,
-      headers: [{"authorization", "Bearer #{token}"}],
-      adapter_opts: adapter_opts
-    ]
-
-    opts =
-      if use_ssl do
-        cred = GRPC.Credential.new(ssl: [cacerts: :public_key.cacerts_get()])
-        Keyword.put(base_opts, :cred, cred)
-      else
-        base_opts
-      end
-
-    case GRPC.Stub.connect(endpoint, opts) do
-      {:ok, channel} -> {:ok, channel}
-      {:error, reason} -> {:error, {:connect_failed, reason}}
-    end
-  end
-
-  defp send_on_stream(grpc_stream, request) do
-    case GRPC.Stub.send_request(grpc_stream, request) do
-      %GRPC.Client.Stream{} = stream -> {:ok, stream}
-      {:error, reason} -> {:error, reason}
-    end
-  catch
-    kind, reason -> {:error, {kind, reason}}
+  defp send_on_stream(grpc_stream, request, state) do
+    state.grpc_client.send_request(grpc_stream, request, state.grpc_client_config)
   end
 
   defp reset_connection(state, reason) do
@@ -696,7 +657,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   defp cancel_grpc_stream(%{grpc_stream: grpc_stream} = state) do
     # Skip cancel if the Mint StreamResponseProcess is already dead — calling
-    # GRPC.Stub.cancel would crash the ConnectionProcess. See decisions.md.
+    # cancel would crash the ConnectionProcess. See decisions.md.
     srp_alive? =
       case grpc_stream do
         %{payload: %{stream_response_pid: pid}} when is_pid(pid) -> Process.alive?(pid)
@@ -704,11 +665,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       end
 
     if srp_alive? do
-      try do
-        GRPC.Stub.cancel(grpc_stream)
-      catch
-        _, _ -> :ok
-      end
+      state.grpc_client.cancel(grpc_stream, state.grpc_client_config)
     end
 
     state
@@ -726,11 +683,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       end
 
     if conn_alive? do
-      try do
-        GRPC.Stub.disconnect(channel)
-      catch
-        _, _ -> :ok
-      end
+      state.grpc_client.disconnect(channel, state.grpc_client_config)
     end
 
     state
@@ -1007,12 +960,6 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     DateTime.from_unix!(seconds * 1_000_000_000 + nanos, :nanosecond)
   rescue
     _ -> nil
-  end
-
-  # --- Private: auth ---
-
-  defp fetch_token(%{token_generator: {mod, fun, args}}) do
-    apply(mod, fun, args)
   end
 
   # Flush AckBatcher if its process is currently alive. Guards against the

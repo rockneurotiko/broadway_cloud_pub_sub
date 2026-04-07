@@ -1,5 +1,7 @@
 defmodule Google.Pubsub.V1.SchemaView do
-  @moduledoc false
+  @moduledoc """
+  View of Schema object fields to be returned by GetSchema and ListSchemas.
+  """
 
   use Protobuf,
     enum: true,
@@ -13,7 +15,9 @@ defmodule Google.Pubsub.V1.SchemaView do
 end
 
 defmodule Google.Pubsub.V1.Encoding do
-  @moduledoc false
+  @moduledoc """
+  Possible encoding types for messages.
+  """
 
   use Protobuf,
     enum: true,
@@ -27,7 +31,9 @@ defmodule Google.Pubsub.V1.Encoding do
 end
 
 defmodule Google.Pubsub.V1.Schema.Type do
-  @moduledoc false
+  @moduledoc """
+  Possible schema definition types.
+  """
 
   use Protobuf,
     enum: true,
@@ -41,7 +47,9 @@ defmodule Google.Pubsub.V1.Schema.Type do
 end
 
 defmodule Google.Pubsub.V1.Schema do
-  @moduledoc false
+  @moduledoc """
+  A schema resource.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.Schema",
@@ -61,7 +69,9 @@ defmodule Google.Pubsub.V1.Schema do
 end
 
 defmodule Google.Pubsub.V1.CreateSchemaRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the CreateSchema method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.CreateSchemaRequest",
@@ -74,7 +84,9 @@ defmodule Google.Pubsub.V1.CreateSchemaRequest do
 end
 
 defmodule Google.Pubsub.V1.GetSchemaRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the GetSchema method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.GetSchemaRequest",
@@ -86,7 +98,9 @@ defmodule Google.Pubsub.V1.GetSchemaRequest do
 end
 
 defmodule Google.Pubsub.V1.ListSchemasRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ListSchemas` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSchemasRequest",
@@ -100,7 +114,9 @@ defmodule Google.Pubsub.V1.ListSchemasRequest do
 end
 
 defmodule Google.Pubsub.V1.ListSchemasResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ListSchemas` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSchemasResponse",
@@ -112,7 +128,9 @@ defmodule Google.Pubsub.V1.ListSchemasResponse do
 end
 
 defmodule Google.Pubsub.V1.ListSchemaRevisionsRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ListSchemaRevisions` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSchemaRevisionsRequest",
@@ -126,7 +144,9 @@ defmodule Google.Pubsub.V1.ListSchemaRevisionsRequest do
 end
 
 defmodule Google.Pubsub.V1.ListSchemaRevisionsResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ListSchemaRevisions` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSchemaRevisionsResponse",
@@ -138,7 +158,9 @@ defmodule Google.Pubsub.V1.ListSchemaRevisionsResponse do
 end
 
 defmodule Google.Pubsub.V1.CommitSchemaRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for CommitSchema method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.CommitSchemaRequest",
@@ -150,7 +172,9 @@ defmodule Google.Pubsub.V1.CommitSchemaRequest do
 end
 
 defmodule Google.Pubsub.V1.RollbackSchemaRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `RollbackSchema` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.RollbackSchemaRequest",
@@ -162,7 +186,9 @@ defmodule Google.Pubsub.V1.RollbackSchemaRequest do
 end
 
 defmodule Google.Pubsub.V1.DeleteSchemaRevisionRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `DeleteSchemaRevision` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DeleteSchemaRevisionRequest",
@@ -174,7 +200,9 @@ defmodule Google.Pubsub.V1.DeleteSchemaRevisionRequest do
 end
 
 defmodule Google.Pubsub.V1.DeleteSchemaRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `DeleteSchema` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DeleteSchemaRequest",
@@ -185,7 +213,9 @@ defmodule Google.Pubsub.V1.DeleteSchemaRequest do
 end
 
 defmodule Google.Pubsub.V1.ValidateSchemaRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ValidateSchema` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ValidateSchemaRequest",
@@ -197,7 +227,10 @@ defmodule Google.Pubsub.V1.ValidateSchemaRequest do
 end
 
 defmodule Google.Pubsub.V1.ValidateSchemaResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ValidateSchema` method.
+  Empty for now.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ValidateSchemaResponse",
@@ -206,7 +239,9 @@ defmodule Google.Pubsub.V1.ValidateSchemaResponse do
 end
 
 defmodule Google.Pubsub.V1.ValidateMessageRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ValidateMessage` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ValidateMessageRequest",
@@ -223,7 +258,10 @@ defmodule Google.Pubsub.V1.ValidateMessageRequest do
 end
 
 defmodule Google.Pubsub.V1.ValidateMessageResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ValidateMessage` method.
+  Empty for now.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ValidateMessageResponse",
@@ -232,7 +270,9 @@ defmodule Google.Pubsub.V1.ValidateMessageResponse do
 end
 
 defmodule Google.Pubsub.V1.SchemaService.Service do
-  @moduledoc false
+  @moduledoc """
+  Service for doing schema-related operations.
+  """
 
   use GRPC.Service, name: "google.pubsub.v1.SchemaService", protoc_gen_elixir_version: "0.16.0"
 
@@ -274,7 +314,5 @@ defmodule Google.Pubsub.V1.SchemaService.Service do
 end
 
 defmodule Google.Pubsub.V1.SchemaService.Stub do
-  @moduledoc false
-
   use GRPC.Stub, service: Google.Pubsub.V1.SchemaService.Service
 end

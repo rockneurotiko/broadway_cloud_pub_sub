@@ -1,5 +1,7 @@
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsKinesis.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for ingestion from Amazon Kinesis Data Streams.
+  """
 
   use Protobuf,
     enum: true,
@@ -16,7 +18,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsKinesis.State do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for ingestion from Cloud Storage.
+  """
 
   use Protobuf,
     enum: true,
@@ -33,7 +37,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.State do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AzureEventHubs.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for managed ingestion from Event Hubs.
+  """
 
   use Protobuf,
     enum: true,
@@ -52,7 +58,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AzureEventHubs.State do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsMsk.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for managed ingestion from Amazon MSK.
+  """
 
   use Protobuf,
     enum: true,
@@ -69,7 +77,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsMsk.State do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.ConfluentCloud.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for managed ingestion from Confluent Cloud.
+  """
 
   use Protobuf,
     enum: true,
@@ -87,7 +97,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.ConfluentCloud.State do
 end
 
 defmodule Google.Pubsub.V1.PlatformLogsSettings.Severity do
-  @moduledoc false
+  @moduledoc """
+  Severity levels of Platform Logs.
+  """
 
   use Protobuf,
     enum: true,
@@ -104,7 +116,9 @@ defmodule Google.Pubsub.V1.PlatformLogsSettings.Severity do
 end
 
 defmodule Google.Pubsub.V1.Topic.State do
-  @moduledoc false
+  @moduledoc """
+  The state of the topic.
+  """
 
   use Protobuf,
     enum: true,
@@ -118,7 +132,9 @@ defmodule Google.Pubsub.V1.Topic.State do
 end
 
 defmodule Google.Pubsub.V1.Subscription.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for a subscription.
+  """
 
   use Protobuf,
     enum: true,
@@ -132,7 +148,9 @@ defmodule Google.Pubsub.V1.Subscription.State do
 end
 
 defmodule Google.Pubsub.V1.BigQueryConfig.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for a BigQuery subscription.
+  """
 
   use Protobuf,
     enum: true,
@@ -150,7 +168,10 @@ defmodule Google.Pubsub.V1.BigQueryConfig.State do
 end
 
 defmodule Google.Pubsub.V1.BigtableConfig.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for a Bigtable subscription.
+  Note: more states could be added in the future. Please code accordingly.
+  """
 
   use Protobuf,
     enum: true,
@@ -169,7 +190,9 @@ defmodule Google.Pubsub.V1.BigtableConfig.State do
 end
 
 defmodule Google.Pubsub.V1.CloudStorageConfig.State do
-  @moduledoc false
+  @moduledoc """
+  Possible states for a Cloud Storage subscription.
+  """
 
   use Protobuf,
     enum: true,
@@ -187,7 +210,9 @@ defmodule Google.Pubsub.V1.CloudStorageConfig.State do
 end
 
 defmodule Google.Pubsub.V1.MessageStoragePolicy do
-  @moduledoc false
+  @moduledoc """
+  A policy constraining the storage of messages published to the topic.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.MessageStoragePolicy",
@@ -205,7 +230,9 @@ defmodule Google.Pubsub.V1.MessageStoragePolicy do
 end
 
 defmodule Google.Pubsub.V1.SchemaSettings do
-  @moduledoc false
+  @moduledoc """
+  Settings for validating messages published against a schema.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.SchemaSettings",
@@ -219,7 +246,9 @@ defmodule Google.Pubsub.V1.SchemaSettings do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsKinesis do
-  @moduledoc false
+  @moduledoc """
+  Ingestion settings for Amazon Kinesis Data Streams.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.AwsKinesis",
@@ -239,7 +268,11 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsKinesis do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.TextFormat do
-  @moduledoc false
+  @moduledoc """
+  Configuration for reading Cloud Storage data in text format. Each line of
+  text as specified by the delimiter will be set to the `data` field of a
+  Pub/Sub message.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.CloudStorage.TextFormat",
@@ -250,7 +283,11 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.TextFormat d
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.AvroFormat do
-  @moduledoc false
+  @moduledoc """
+  Configuration for reading Cloud Storage data in Avro binary format. The
+  bytes of each object will be set to the `data` field of a Pub/Sub
+  message.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.CloudStorage.AvroFormat",
@@ -259,7 +296,12 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.AvroFormat d
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.PubSubAvroFormat do
-  @moduledoc false
+  @moduledoc """
+  Configuration for reading Cloud Storage data written via [Cloud Storage
+  subscriptions](https://cloud.google.com/pubsub/docs/cloudstorage). The
+  data and attributes fields of the originally exported Pub/Sub message
+  will be restored when publishing.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.CloudStorage.PubSubAvroFormat",
@@ -268,7 +310,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage.PubSubAvroFo
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage do
-  @moduledoc false
+  @moduledoc """
+  Ingestion settings for Cloud Storage.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.CloudStorage",
@@ -316,7 +360,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.CloudStorage do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AzureEventHubs do
-  @moduledoc false
+  @moduledoc """
+  Ingestion settings for Azure Event Hubs.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.AzureEventHubs",
@@ -339,7 +385,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AzureEventHubs do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsMsk do
-  @moduledoc false
+  @moduledoc """
+  Ingestion settings for Amazon MSK.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.AwsMsk",
@@ -359,7 +407,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.AwsMsk do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings.ConfluentCloud do
-  @moduledoc false
+  @moduledoc """
+  Ingestion settings for Confluent Cloud.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings.ConfluentCloud",
@@ -380,7 +430,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings.ConfluentCloud do
 end
 
 defmodule Google.Pubsub.V1.IngestionDataSourceSettings do
-  @moduledoc false
+  @moduledoc """
+  Settings for an ingestion data source on a topic.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionDataSourceSettings",
@@ -432,7 +484,9 @@ defmodule Google.Pubsub.V1.IngestionDataSourceSettings do
 end
 
 defmodule Google.Pubsub.V1.PlatformLogsSettings do
-  @moduledoc false
+  @moduledoc """
+  Settings for Platform Logs produced by Pub/Sub.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PlatformLogsSettings",
@@ -447,7 +501,16 @@ defmodule Google.Pubsub.V1.PlatformLogsSettings do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.ApiViolationReason do
-  @moduledoc false
+  @moduledoc """
+  Specifies the reason why some data may have been left out of
+  the desired Pub/Sub message due to the API message limits
+  (https://cloud.google.com/pubsub/quotas#resource_limits). For example,
+  when the number of attributes is larger than 100, the number of
+  attributes is truncated to 100 to respect the limit on the attribute count.
+  Other attribute limits are treated similarly. When the size of the desired
+  message would've been larger than 10MB, the message won't be published at
+  all, and ingestion of the subsequent messages will proceed as normal.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.ApiViolationReason",
@@ -456,7 +519,10 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.ApiViolationReason do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.AvroFailureReason do
-  @moduledoc false
+  @moduledoc """
+  Set when an Avro file is unsupported or its format is not valid. When this
+  occurs, one or more Avro objects won't be ingested.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.AvroFailureReason",
@@ -465,7 +531,10 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.AvroFailureReason do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.SchemaViolationReason do
-  @moduledoc false
+  @moduledoc """
+  Set when a Pub/Sub message fails to get published due to a schema
+  validation violation.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.SchemaViolationReason",
@@ -474,7 +543,10 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.SchemaViolationReason do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.MessageTransformationFailureReason do
-  @moduledoc false
+  @moduledoc """
+  Set when a Pub/Sub message fails to get published due to a message
+  transformation error.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.MessageTransformationFailureReason",
@@ -483,7 +555,9 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.MessageTransformationFailureRea
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.CloudStorageFailure do
-  @moduledoc false
+  @moduledoc """
+  Failure when ingesting from a Cloud Storage source.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.CloudStorageFailure",
@@ -526,7 +600,9 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.CloudStorageFailure do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.AwsMskFailureReason do
-  @moduledoc false
+  @moduledoc """
+  Failure when ingesting from an Amazon MSK source.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.AwsMskFailureReason",
@@ -563,7 +639,9 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.AwsMskFailureReason do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.AzureEventHubsFailureReason do
-  @moduledoc false
+  @moduledoc """
+  Failure when ingesting from an Azure Event Hubs source.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.AzureEventHubsFailureReason",
@@ -600,7 +678,9 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.AzureEventHubsFailureReason do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.ConfluentCloudFailureReason do
-  @moduledoc false
+  @moduledoc """
+  Failure when ingesting from a Confluent Cloud source.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.ConfluentCloudFailureReason",
@@ -637,7 +717,9 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.ConfluentCloudFailureReason do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent.AwsKinesisFailureReason do
-  @moduledoc false
+  @moduledoc """
+  Failure when ingesting from an AWS Kinesis source.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent.AwsKinesisFailureReason",
@@ -673,7 +755,10 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent.AwsKinesisFailureReason do
 end
 
 defmodule Google.Pubsub.V1.IngestionFailureEvent do
-  @moduledoc false
+  @moduledoc """
+  Payload of the Platform Log entry sent when a failure is encountered while
+  ingesting.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.IngestionFailureEvent",
@@ -722,7 +807,10 @@ defmodule Google.Pubsub.V1.IngestionFailureEvent do
 end
 
 defmodule Google.Pubsub.V1.JavaScriptUDF do
-  @moduledoc false
+  @moduledoc """
+  User-defined JavaScript function that can transform or filter a Pub/Sub
+  message.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.JavaScriptUDF",
@@ -734,7 +822,9 @@ defmodule Google.Pubsub.V1.JavaScriptUDF do
 end
 
 defmodule Google.Pubsub.V1.AIInference.UnstructuredInference do
-  @moduledoc false
+  @moduledoc """
+  Configuration for making inferences using arbitrary JSON payloads.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.AIInference.UnstructuredInference",
@@ -745,7 +835,9 @@ defmodule Google.Pubsub.V1.AIInference.UnstructuredInference do
 end
 
 defmodule Google.Pubsub.V1.AIInference do
-  @moduledoc false
+  @moduledoc """
+  Configuration for making inference requests against Vertex AI models.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.AIInference",
@@ -771,7 +863,9 @@ defmodule Google.Pubsub.V1.AIInference do
 end
 
 defmodule Google.Pubsub.V1.MessageTransform do
-  @moduledoc false
+  @moduledoc """
+  All supported message transforms types.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.MessageTransform",
@@ -799,8 +893,6 @@ defmodule Google.Pubsub.V1.MessageTransform do
 end
 
 defmodule Google.Pubsub.V1.Topic.LabelsEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.Topic.LabelsEntry",
     map: true,
@@ -812,8 +904,6 @@ defmodule Google.Pubsub.V1.Topic.LabelsEntry do
 end
 
 defmodule Google.Pubsub.V1.Topic.TagsEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.Topic.TagsEntry",
     map: true,
@@ -825,7 +915,9 @@ defmodule Google.Pubsub.V1.Topic.TagsEntry do
 end
 
 defmodule Google.Pubsub.V1.Topic do
-  @moduledoc false
+  @moduledoc """
+  A topic resource.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.Topic",
@@ -887,8 +979,6 @@ defmodule Google.Pubsub.V1.Topic do
 end
 
 defmodule Google.Pubsub.V1.PubsubMessage.AttributesEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.PubsubMessage.AttributesEntry",
     map: true,
@@ -900,7 +990,16 @@ defmodule Google.Pubsub.V1.PubsubMessage.AttributesEntry do
 end
 
 defmodule Google.Pubsub.V1.PubsubMessage do
-  @moduledoc false
+  @moduledoc """
+  A message that is published by publishers and consumed by subscribers. The
+  message must contain either a non-empty data field or at least one attribute.
+  Note that client libraries represent this object differently
+  depending on the language. See the corresponding [client library
+  documentation](https://cloud.google.com/pubsub/docs/reference/libraries) for
+  more information. See [quotas and limits]
+  (https://cloud.google.com/pubsub/quotas) for more information about message
+  limits.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PubsubMessage",
@@ -922,7 +1021,9 @@ defmodule Google.Pubsub.V1.PubsubMessage do
 end
 
 defmodule Google.Pubsub.V1.GetTopicRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the GetTopic method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.GetTopicRequest",
@@ -933,7 +1034,9 @@ defmodule Google.Pubsub.V1.GetTopicRequest do
 end
 
 defmodule Google.Pubsub.V1.UpdateTopicRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the UpdateTopic method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.UpdateTopicRequest",
@@ -950,7 +1053,9 @@ defmodule Google.Pubsub.V1.UpdateTopicRequest do
 end
 
 defmodule Google.Pubsub.V1.PublishRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the Publish method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PublishRequest",
@@ -962,7 +1067,9 @@ defmodule Google.Pubsub.V1.PublishRequest do
 end
 
 defmodule Google.Pubsub.V1.PublishResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `Publish` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PublishResponse",
@@ -978,7 +1085,9 @@ defmodule Google.Pubsub.V1.PublishResponse do
 end
 
 defmodule Google.Pubsub.V1.ListTopicsRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ListTopics` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListTopicsRequest",
@@ -991,7 +1100,9 @@ defmodule Google.Pubsub.V1.ListTopicsRequest do
 end
 
 defmodule Google.Pubsub.V1.ListTopicsResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ListTopics` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListTopicsResponse",
@@ -1003,7 +1114,9 @@ defmodule Google.Pubsub.V1.ListTopicsResponse do
 end
 
 defmodule Google.Pubsub.V1.ListTopicSubscriptionsRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ListTopicSubscriptions` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListTopicSubscriptionsRequest",
@@ -1016,7 +1129,9 @@ defmodule Google.Pubsub.V1.ListTopicSubscriptionsRequest do
 end
 
 defmodule Google.Pubsub.V1.ListTopicSubscriptionsResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ListTopicSubscriptions` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListTopicSubscriptionsResponse",
@@ -1028,7 +1143,9 @@ defmodule Google.Pubsub.V1.ListTopicSubscriptionsResponse do
 end
 
 defmodule Google.Pubsub.V1.ListTopicSnapshotsRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ListTopicSnapshots` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListTopicSnapshotsRequest",
@@ -1041,7 +1158,9 @@ defmodule Google.Pubsub.V1.ListTopicSnapshotsRequest do
 end
 
 defmodule Google.Pubsub.V1.ListTopicSnapshotsResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ListTopicSnapshots` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListTopicSnapshotsResponse",
@@ -1053,7 +1172,9 @@ defmodule Google.Pubsub.V1.ListTopicSnapshotsResponse do
 end
 
 defmodule Google.Pubsub.V1.DeleteTopicRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `DeleteTopic` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DeleteTopicRequest",
@@ -1064,7 +1185,9 @@ defmodule Google.Pubsub.V1.DeleteTopicRequest do
 end
 
 defmodule Google.Pubsub.V1.DetachSubscriptionRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the DetachSubscription method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DetachSubscriptionRequest",
@@ -1075,7 +1198,10 @@ defmodule Google.Pubsub.V1.DetachSubscriptionRequest do
 end
 
 defmodule Google.Pubsub.V1.DetachSubscriptionResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the DetachSubscription method.
+  Reserved for future use.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DetachSubscriptionResponse",
@@ -1084,7 +1210,10 @@ defmodule Google.Pubsub.V1.DetachSubscriptionResponse do
 end
 
 defmodule Google.Pubsub.V1.Subscription.AnalyticsHubSubscriptionInfo do
-  @moduledoc false
+  @moduledoc """
+  Information about an associated [Analytics Hub
+  subscription](https://cloud.google.com/bigquery/docs/analytics-hub-manage-subscriptions).
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.Subscription.AnalyticsHubSubscriptionInfo",
@@ -1096,8 +1225,6 @@ defmodule Google.Pubsub.V1.Subscription.AnalyticsHubSubscriptionInfo do
 end
 
 defmodule Google.Pubsub.V1.Subscription.LabelsEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.Subscription.LabelsEntry",
     map: true,
@@ -1109,8 +1236,6 @@ defmodule Google.Pubsub.V1.Subscription.LabelsEntry do
 end
 
 defmodule Google.Pubsub.V1.Subscription.TagsEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.Subscription.TagsEntry",
     map: true,
@@ -1122,7 +1247,11 @@ defmodule Google.Pubsub.V1.Subscription.TagsEntry do
 end
 
 defmodule Google.Pubsub.V1.Subscription do
-  @moduledoc false
+  @moduledoc """
+  A subscription resource. If none of `push_config`, `bigquery_config`, or
+  `cloud_storage_config` is set, then the subscriber will pull and ack messages
+  using API methods. At most one of these fields may be set.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.Subscription",
@@ -1245,7 +1374,19 @@ defmodule Google.Pubsub.V1.Subscription do
 end
 
 defmodule Google.Pubsub.V1.RetryPolicy do
-  @moduledoc false
+  @moduledoc """
+  A policy that specifies how Pub/Sub retries message delivery.
+
+  Retry delay will be exponential based on provided minimum and maximum
+  backoffs. https://en.wikipedia.org/wiki/Exponential_backoff.
+
+  RetryPolicy will be triggered on NACKs or acknowledgment deadline exceeded
+  events for a given message.
+
+  Retry Policy is implemented on a best effort basis. At times, the delay
+  between consecutive deliveries may not match the configuration. That is,
+  delay can be more or less than configured backoff.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.RetryPolicy",
@@ -1266,7 +1407,13 @@ defmodule Google.Pubsub.V1.RetryPolicy do
 end
 
 defmodule Google.Pubsub.V1.DeadLetterPolicy do
-  @moduledoc false
+  @moduledoc """
+  Dead lettering is done on a best effort basis. The same message might be
+  dead lettered multiple times.
+
+  If validation on any of the fields fails at subscription creation/updation,
+  the create/update subscription request will fail.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DeadLetterPolicy",
@@ -1283,7 +1430,10 @@ defmodule Google.Pubsub.V1.DeadLetterPolicy do
 end
 
 defmodule Google.Pubsub.V1.ExpirationPolicy do
-  @moduledoc false
+  @moduledoc """
+  A policy that specifies the conditions for resource expiration (i.e.,
+  automatic resource deletion).
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ExpirationPolicy",
@@ -1294,7 +1444,11 @@ defmodule Google.Pubsub.V1.ExpirationPolicy do
 end
 
 defmodule Google.Pubsub.V1.PushConfig.OidcToken do
-  @moduledoc false
+  @moduledoc """
+  Contains information needed for generating an
+  [OpenID Connect
+  token](https://developers.google.com/identity/protocols/OpenIDConnect).
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PushConfig.OidcToken",
@@ -1311,7 +1465,11 @@ defmodule Google.Pubsub.V1.PushConfig.OidcToken do
 end
 
 defmodule Google.Pubsub.V1.PushConfig.PubsubWrapper do
-  @moduledoc false
+  @moduledoc """
+  The payload to the push endpoint is in the form of the JSON representation
+  of a PubsubMessage
+  (https://cloud.google.com/pubsub/docs/reference/rpc/google.pubsub.v1#pubsubmessage).
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PushConfig.PubsubWrapper",
@@ -1320,7 +1478,9 @@ defmodule Google.Pubsub.V1.PushConfig.PubsubWrapper do
 end
 
 defmodule Google.Pubsub.V1.PushConfig.NoWrapper do
-  @moduledoc false
+  @moduledoc """
+  Sets the `data` field as the HTTP body for delivery.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PushConfig.NoWrapper",
@@ -1331,8 +1491,6 @@ defmodule Google.Pubsub.V1.PushConfig.NoWrapper do
 end
 
 defmodule Google.Pubsub.V1.PushConfig.AttributesEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.PushConfig.AttributesEntry",
     map: true,
@@ -1344,7 +1502,9 @@ defmodule Google.Pubsub.V1.PushConfig.AttributesEntry do
 end
 
 defmodule Google.Pubsub.V1.PushConfig do
-  @moduledoc false
+  @moduledoc """
+  Configuration for a push delivery endpoint.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PushConfig",
@@ -1387,7 +1547,9 @@ defmodule Google.Pubsub.V1.PushConfig do
 end
 
 defmodule Google.Pubsub.V1.BigQueryConfig do
-  @moduledoc false
+  @moduledoc """
+  Configuration for a BigQuery subscription.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.BigQueryConfig",
@@ -1409,7 +1571,14 @@ defmodule Google.Pubsub.V1.BigQueryConfig do
 end
 
 defmodule Google.Pubsub.V1.BigtableConfig do
-  @moduledoc false
+  @moduledoc """
+  Configuration for a Bigtable subscription. The Pub/Sub message will be
+  written to a Bigtable row as follows:
+  - row key: subscription name and message ID delimited by #.
+  - columns: message bytes written to a single column family "data" with an
+    empty-string column qualifier.
+  - cell timestamp: the message publish timestamp.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.BigtableConfig",
@@ -1430,7 +1599,11 @@ defmodule Google.Pubsub.V1.BigtableConfig do
 end
 
 defmodule Google.Pubsub.V1.CloudStorageConfig.TextConfig do
-  @moduledoc false
+  @moduledoc """
+  Configuration for writing message data in text format.
+  Message payloads will be written to files as raw text, separated by a
+  newline.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.CloudStorageConfig.TextConfig",
@@ -1439,7 +1612,10 @@ defmodule Google.Pubsub.V1.CloudStorageConfig.TextConfig do
 end
 
 defmodule Google.Pubsub.V1.CloudStorageConfig.AvroConfig do
-  @moduledoc false
+  @moduledoc """
+  Configuration for writing message data in Avro format.
+  Message payloads and metadata will be written to files as an Avro binary.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.CloudStorageConfig.AvroConfig",
@@ -1451,7 +1627,9 @@ defmodule Google.Pubsub.V1.CloudStorageConfig.AvroConfig do
 end
 
 defmodule Google.Pubsub.V1.CloudStorageConfig do
-  @moduledoc false
+  @moduledoc """
+  Configuration for a Cloud Storage subscription.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.CloudStorageConfig",
@@ -1502,7 +1680,9 @@ defmodule Google.Pubsub.V1.CloudStorageConfig do
 end
 
 defmodule Google.Pubsub.V1.ReceivedMessage do
-  @moduledoc false
+  @moduledoc """
+  A message and its corresponding acknowledgment ID.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ReceivedMessage",
@@ -1515,7 +1695,9 @@ defmodule Google.Pubsub.V1.ReceivedMessage do
 end
 
 defmodule Google.Pubsub.V1.GetSubscriptionRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the GetSubscription method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.GetSubscriptionRequest",
@@ -1526,7 +1708,9 @@ defmodule Google.Pubsub.V1.GetSubscriptionRequest do
 end
 
 defmodule Google.Pubsub.V1.UpdateSubscriptionRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the UpdateSubscription method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.UpdateSubscriptionRequest",
@@ -1543,7 +1727,9 @@ defmodule Google.Pubsub.V1.UpdateSubscriptionRequest do
 end
 
 defmodule Google.Pubsub.V1.ListSubscriptionsRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ListSubscriptions` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSubscriptionsRequest",
@@ -1556,7 +1742,9 @@ defmodule Google.Pubsub.V1.ListSubscriptionsRequest do
 end
 
 defmodule Google.Pubsub.V1.ListSubscriptionsResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ListSubscriptions` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSubscriptionsResponse",
@@ -1568,7 +1756,9 @@ defmodule Google.Pubsub.V1.ListSubscriptionsResponse do
 end
 
 defmodule Google.Pubsub.V1.DeleteSubscriptionRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the DeleteSubscription method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DeleteSubscriptionRequest",
@@ -1579,7 +1769,9 @@ defmodule Google.Pubsub.V1.DeleteSubscriptionRequest do
 end
 
 defmodule Google.Pubsub.V1.ModifyPushConfigRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the ModifyPushConfig method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ModifyPushConfigRequest",
@@ -1596,7 +1788,9 @@ defmodule Google.Pubsub.V1.ModifyPushConfigRequest do
 end
 
 defmodule Google.Pubsub.V1.PullRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `Pull` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PullRequest",
@@ -1609,7 +1803,9 @@ defmodule Google.Pubsub.V1.PullRequest do
 end
 
 defmodule Google.Pubsub.V1.PullResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `Pull` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.PullResponse",
@@ -1625,7 +1821,9 @@ defmodule Google.Pubsub.V1.PullResponse do
 end
 
 defmodule Google.Pubsub.V1.ModifyAckDeadlineRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the ModifyAckDeadline method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ModifyAckDeadlineRequest",
@@ -1643,7 +1841,9 @@ defmodule Google.Pubsub.V1.ModifyAckDeadlineRequest do
 end
 
 defmodule Google.Pubsub.V1.AcknowledgeRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the Acknowledge method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.AcknowledgeRequest",
@@ -1655,7 +1855,11 @@ defmodule Google.Pubsub.V1.AcknowledgeRequest do
 end
 
 defmodule Google.Pubsub.V1.StreamingPullRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `StreamingPull` streaming RPC method. This request is used to
+  establish the initial stream as well as to stream acknowledgments and ack
+  deadline modifications from the client to the server.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.StreamingPullRequest",
@@ -1703,7 +1907,10 @@ defmodule Google.Pubsub.V1.StreamingPullRequest do
 end
 
 defmodule Google.Pubsub.V1.StreamingPullResponse.AcknowledgeConfirmation do
-  @moduledoc false
+  @moduledoc """
+  Acknowledgment IDs sent in one or more previous requests to acknowledge a
+  previously received message.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.StreamingPullResponse.AcknowledgeConfirmation",
@@ -1735,7 +1942,10 @@ defmodule Google.Pubsub.V1.StreamingPullResponse.AcknowledgeConfirmation do
 end
 
 defmodule Google.Pubsub.V1.StreamingPullResponse.ModifyAckDeadlineConfirmation do
-  @moduledoc false
+  @moduledoc """
+  Acknowledgment IDs sent in one or more previous requests to modify the
+  deadline for a specific message.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.StreamingPullResponse.ModifyAckDeadlineConfirmation",
@@ -1760,7 +1970,9 @@ defmodule Google.Pubsub.V1.StreamingPullResponse.ModifyAckDeadlineConfirmation d
 end
 
 defmodule Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties do
-  @moduledoc false
+  @moduledoc """
+  Subscription properties sent as part of the response.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.StreamingPullResponse.SubscriptionProperties",
@@ -1781,7 +1993,10 @@ defmodule Google.Pubsub.V1.StreamingPullResponse.SubscriptionProperties do
 end
 
 defmodule Google.Pubsub.V1.StreamingPullResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `StreamingPull` method. This response is used to stream
+  messages from the server to the client.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.StreamingPullResponse",
@@ -1815,8 +2030,6 @@ defmodule Google.Pubsub.V1.StreamingPullResponse do
 end
 
 defmodule Google.Pubsub.V1.CreateSnapshotRequest.LabelsEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.CreateSnapshotRequest.LabelsEntry",
     map: true,
@@ -1828,8 +2041,6 @@ defmodule Google.Pubsub.V1.CreateSnapshotRequest.LabelsEntry do
 end
 
 defmodule Google.Pubsub.V1.CreateSnapshotRequest.TagsEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.CreateSnapshotRequest.TagsEntry",
     map: true,
@@ -1841,7 +2052,9 @@ defmodule Google.Pubsub.V1.CreateSnapshotRequest.TagsEntry do
 end
 
 defmodule Google.Pubsub.V1.CreateSnapshotRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `CreateSnapshot` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.CreateSnapshotRequest",
@@ -1867,7 +2080,9 @@ defmodule Google.Pubsub.V1.CreateSnapshotRequest do
 end
 
 defmodule Google.Pubsub.V1.UpdateSnapshotRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the UpdateSnapshot method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.UpdateSnapshotRequest",
@@ -1884,8 +2099,6 @@ defmodule Google.Pubsub.V1.UpdateSnapshotRequest do
 end
 
 defmodule Google.Pubsub.V1.Snapshot.LabelsEntry do
-  @moduledoc false
-
   use Protobuf,
     full_name: "google.pubsub.v1.Snapshot.LabelsEntry",
     map: true,
@@ -1897,7 +2110,13 @@ defmodule Google.Pubsub.V1.Snapshot.LabelsEntry do
 end
 
 defmodule Google.Pubsub.V1.Snapshot do
-  @moduledoc false
+  @moduledoc """
+  A snapshot resource. Snapshots are used in
+  [Seek](https://cloud.google.com/pubsub/docs/replay-overview)
+  operations, which allow you to manage message acknowledgments in bulk. That
+  is, you can set the acknowledgment state of messages in an existing
+  subscription to the state captured by a snapshot.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.Snapshot",
@@ -1922,7 +2141,9 @@ defmodule Google.Pubsub.V1.Snapshot do
 end
 
 defmodule Google.Pubsub.V1.GetSnapshotRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the GetSnapshot method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.GetSnapshotRequest",
@@ -1933,7 +2154,9 @@ defmodule Google.Pubsub.V1.GetSnapshotRequest do
 end
 
 defmodule Google.Pubsub.V1.ListSnapshotsRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `ListSnapshots` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSnapshotsRequest",
@@ -1946,7 +2169,9 @@ defmodule Google.Pubsub.V1.ListSnapshotsRequest do
 end
 
 defmodule Google.Pubsub.V1.ListSnapshotsResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `ListSnapshots` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.ListSnapshotsResponse",
@@ -1958,7 +2183,9 @@ defmodule Google.Pubsub.V1.ListSnapshotsResponse do
 end
 
 defmodule Google.Pubsub.V1.DeleteSnapshotRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `DeleteSnapshot` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.DeleteSnapshotRequest",
@@ -1969,7 +2196,9 @@ defmodule Google.Pubsub.V1.DeleteSnapshotRequest do
 end
 
 defmodule Google.Pubsub.V1.SeekRequest do
-  @moduledoc false
+  @moduledoc """
+  Request for the `Seek` method.
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.SeekRequest",
@@ -1984,7 +2213,9 @@ defmodule Google.Pubsub.V1.SeekRequest do
 end
 
 defmodule Google.Pubsub.V1.SeekResponse do
-  @moduledoc false
+  @moduledoc """
+  Response for the `Seek` method (this response is empty).
+  """
 
   use Protobuf,
     full_name: "google.pubsub.v1.SeekResponse",
@@ -1993,7 +2224,10 @@ defmodule Google.Pubsub.V1.SeekResponse do
 end
 
 defmodule Google.Pubsub.V1.Publisher.Service do
-  @moduledoc false
+  @moduledoc """
+  The service that an application uses to manipulate topics, and to send
+  messages to a topic.
+  """
 
   use GRPC.Service, name: "google.pubsub.v1.Publisher", protoc_gen_elixir_version: "0.16.0"
 
@@ -2029,13 +2263,15 @@ defmodule Google.Pubsub.V1.Publisher.Service do
 end
 
 defmodule Google.Pubsub.V1.Publisher.Stub do
-  @moduledoc false
-
   use GRPC.Stub, service: Google.Pubsub.V1.Publisher.Service
 end
 
 defmodule Google.Pubsub.V1.Subscriber.Service do
-  @moduledoc false
+  @moduledoc """
+  The service that an application uses to manipulate subscriptions and to
+  consume messages from a subscription via the `Pull` method or by
+  establishing a bi-directional stream using the `StreamingPull` method.
+  """
 
   use GRPC.Service, name: "google.pubsub.v1.Subscriber", protoc_gen_elixir_version: "0.16.0"
 
@@ -2089,7 +2325,5 @@ defmodule Google.Pubsub.V1.Subscriber.Service do
 end
 
 defmodule Google.Pubsub.V1.Subscriber.Stub do
-  @moduledoc false
-
   use GRPC.Stub, service: Google.Pubsub.V1.Subscriber.Service
 end

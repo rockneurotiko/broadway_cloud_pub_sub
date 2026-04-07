@@ -29,13 +29,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
   # ## Sending on the stream (acks, deadline modifications)
   #
   # After receiving `{:stream_opened, _pid, grpc_stream}`, the StreamManager
-  # calls `GRPC.Stub.send_request(grpc_stream, request)` directly from the
-  # GenServer process. Both the Gun and Mint adapters implement this as a
+  # calls `grpc_client.send_request(grpc_stream, request, client_config)` directly
+  # from the GenServer process. Both the Gun and Mint adapters implement this as a
   # fire-and-forget cast, safe to call from any process concurrently with the
   # reader process enumerating the receive stream.
 
   alias Google.Pubsub.V1.{StreamingPullRequest, StreamingPullResponse}
-  alias Google.Pubsub.V1.Subscriber.Stub
 
   @doc """
   Spawns a linked reader process. The reader opens the gRPC stream and sends
@@ -44,7 +43,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
 
   Returns the reader pid.
   """
-  @spec start_link(pid(), GRPC.Channel.t(), map()) :: pid()
+  @spec start_link(pid(), channel :: term(), map()) :: {:ok, pid()}
   def start_link(manager, channel, config) do
     Task.start_link(fn -> run(manager, channel, config) end)
   end
@@ -52,6 +51,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
   # --- Private ---
 
   defp run(manager, channel, config) do
+    grpc_client = config.grpc_client
+    grpc_client_config = config.grpc_client_config
     client_id = Map.fetch!(config, :client_id)
 
     initial_request = %StreamingPullRequest{
@@ -62,15 +63,17 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
       client_id: client_id
     }
 
-    grpc_stream = Stub.streaming_pull(channel, [])
-    grpc_stream = GRPC.Stub.send_request(grpc_stream, initial_request)
+    grpc_stream = grpc_client.streaming_pull(channel, grpc_client_config)
+
+    {:ok, grpc_stream} =
+      grpc_client.send_request(grpc_stream, initial_request, grpc_client_config)
 
     # Notify the manager that the stream is open. The manager needs the
-    # grpc_stream struct to call GRPC.Stub.send_request for acks and deadline
+    # grpc_stream struct to call send_request for acks and deadline
     # modifications on the bidirectional stream.
     send(manager, {:stream_opened, self(), grpc_stream})
 
-    case GRPC.Stub.recv(grpc_stream, timeout: :infinity) do
+    case grpc_client.recv(grpc_stream, grpc_client_config) do
       {:ok, enum} -> enumerate(enum, manager)
       {:error, error} -> send(manager, {:stream_error, error})
     end

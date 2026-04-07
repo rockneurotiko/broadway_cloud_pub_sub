@@ -33,7 +33,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
 
   alias BroadwayCloudPubSub.{Backoff}
   alias BroadwayCloudPubSub.Streaming.{AckResult, ErrorClassifier}
-  alias Google.Pubsub.V1.{AcknowledgeRequest, ModifyAckDeadlineRequest, Subscriber}
+  alias Google.Pubsub.V1.{AcknowledgeRequest, ModifyAckDeadlineRequest}
 
   require Logger
 
@@ -41,6 +41,8 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
 
   defstruct [
     :config,
+    :grpc_client,
+    :grpc_client_config,
     :channel,
     :backoff,
     # True when a :reconnect message is already queued in the mailbox.
@@ -132,10 +134,15 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
         max: config.backoff_max
       )
 
-    state = %__MODULE__{config: config, backoff: backoff}
+    state = %__MODULE__{
+      config: config,
+      grpc_client: config.grpc_client,
+      grpc_client_config: config.grpc_client_config,
+      backoff: backoff
+    }
 
     # Open initial channel immediately.
-    case open_channel(state) do
+    case state.grpc_client.connect(state.grpc_client_config) do
       {:ok, channel} ->
         {:ok, %{state | channel: channel}}
 
@@ -159,15 +166,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
           ack_ids: ack_ids
         }
 
-        result =
-          :telemetry.span(
-            [:broadway_cloud_pub_sub, :unary, :ack],
-            %{name: state.config.broadway_name, subscription: state.config.subscription},
-            fn ->
-              {Subscriber.Stub.acknowledge(channel, request, timeout: 30_000),
-               %{count: length(ack_ids)}}
-            end
-          )
+        result = state.grpc_client.acknowledge(channel, request, state.grpc_client_config)
 
         case result do
           {:ok, _} ->
@@ -225,15 +224,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
           ack_deadline_seconds: deadline_seconds
         }
 
-        result =
-          :telemetry.span(
-            [:broadway_cloud_pub_sub, :unary, :modack],
-            %{name: state.config.broadway_name, subscription: state.config.subscription},
-            fn ->
-              {Subscriber.Stub.modify_ack_deadline(channel, request, timeout: 30_000),
-               %{count: length(ack_ids)}}
-            end
-          )
+        result = state.grpc_client.modify_ack_deadline(channel, request, state.grpc_client_config)
 
         case result do
           {:ok, _} ->
@@ -280,7 +271,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
     state = %{state | reconnect_pending: false}
     state = disconnect_channel(state)
 
-    case open_channel(state) do
+    case state.grpc_client.connect(state.grpc_client_config) do
       {:ok, channel} ->
         emit_telemetry(:connect, %{}, state.config)
         backoff = Backoff.reset(state.backoff)
@@ -309,13 +300,8 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl GenServer
-  def terminate(_reason, %{channel: channel} = _state) when not is_nil(channel) do
-    try do
-      GRPC.Stub.disconnect(channel)
-    catch
-      _, _ -> :ok
-    end
-
+  def terminate(_reason, %{channel: channel} = state) when not is_nil(channel) do
+    state.grpc_client.disconnect(channel, state.grpc_client_config)
     :ok
   end
 
@@ -324,7 +310,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   # --- Private ---
 
   defp ensure_channel(%{channel: nil} = state) do
-    case open_channel(state) do
+    case state.grpc_client.connect(state.grpc_client_config) do
       {:ok, channel} -> %{state | channel: channel}
       {:error, _} -> state
     end
@@ -345,43 +331,8 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   defp disconnect_channel(%{channel: nil} = state), do: state
 
   defp disconnect_channel(%{channel: channel} = state) do
-    try do
-      GRPC.Stub.disconnect(channel)
-    catch
-      _, _ -> :ok
-    end
-
+    state.grpc_client.disconnect(channel, state.grpc_client_config)
     %{state | channel: nil}
-  end
-
-  defp open_channel(%{config: config}) do
-    token_result =
-      case config.token_generator do
-        {mod, fun, args} -> apply(mod, fun, args)
-      end
-
-    with {:ok, token} <- token_result do
-      adapter_opts = [http2_opts: %{settings_timeout: :infinity}]
-
-      base_opts = [
-        adapter: config.adapter,
-        headers: [{"authorization", "Bearer #{token}"}],
-        adapter_opts: adapter_opts
-      ]
-
-      opts =
-        if config.use_ssl do
-          cred = GRPC.Credential.new(ssl: [cacerts: :public_key.cacerts_get()])
-          Keyword.put(base_opts, :cred, cred)
-        else
-          base_opts
-        end
-
-      case GRPC.Stub.connect(config.grpc_endpoint, opts) do
-        {:ok, channel} -> {:ok, channel}
-        {:error, reason} -> {:error, {:connect_failed, reason}}
-      end
-    end
   end
 
   defp emit_telemetry(event, measurements, config) do

@@ -35,7 +35,7 @@ def deps do
   [
     {:broadway_cloud_pub_sub, "~> 0.10.0"},
     {:goth, "~> 1.3"},
-    {:grpc, "~> 0.9"},
+    {:grpc, "~> 1.0"},
     {:protobuf, "~> 0.12"}
   ]
 end

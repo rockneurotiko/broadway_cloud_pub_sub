@@ -59,6 +59,16 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
     opts =
       base_config() |> Keyword.put(:broadway_name, broadway_name) |> Keyword.merge(extra_opts)
 
+    # Mirror what Producer.prepare_for_start/2 does: call grpc_client.init/1 and
+    # store the resulting config so StreamManager can read it from its config map.
+    grpc_client = Keyword.get(opts, :grpc_client, BroadwayCloudPubSub.Streaming.GrpcClient)
+    {:ok, grpc_client_config} = grpc_client.init(opts)
+
+    opts =
+      opts
+      |> Keyword.put(:grpc_client, grpc_client)
+      |> Keyword.put(:grpc_client_config, grpc_client_config)
+
     rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
     batcher_name = Module.concat(broadway_name, AckBatcher)
 
@@ -894,6 +904,15 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       |> Keyword.put(:broadway_name, broadway_name)
       |> Keyword.merge(extra_opts)
 
+    # Mirror what Producer.prepare_for_start/2 does
+    grpc_client = Keyword.get(opts, :grpc_client, BroadwayCloudPubSub.Streaming.GrpcClient)
+    {:ok, grpc_client_config} = grpc_client.init(opts)
+
+    opts =
+      opts
+      |> Keyword.put(:grpc_client, grpc_client)
+      |> Keyword.put(:grpc_client_config, grpc_client_config)
+
     rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
     batcher_name = Module.concat(broadway_name, AckBatcher)
 
@@ -1107,6 +1126,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         |> Keyword.put(:broadway_name, broadway_name)
         |> Keyword.put(:retry_deadline_ms, 60_000)
 
+      grpc_client = Keyword.get(opts, :grpc_client, BroadwayCloudPubSub.Streaming.GrpcClient)
+      {:ok, grpc_client_config} = grpc_client.init(opts)
+
+      opts =
+        opts
+        |> Keyword.put(:grpc_client, grpc_client)
+        |> Keyword.put(:grpc_client_config, grpc_client_config)
+
       rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
       batcher_name = Module.concat(broadway_name, AckBatcher)
 
@@ -1151,6 +1178,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         base_config()
         |> Keyword.put(:broadway_name, broadway_name)
         |> Keyword.put(:retry_deadline_ms, 60_000)
+
+      grpc_client = Keyword.get(opts, :grpc_client, BroadwayCloudPubSub.Streaming.GrpcClient)
+      {:ok, grpc_client_config} = grpc_client.init(opts)
+
+      opts =
+        opts
+        |> Keyword.put(:grpc_client, grpc_client)
+        |> Keyword.put(:grpc_client_config, grpc_client_config)
 
       rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
       batcher_name = Module.concat(broadway_name, AckBatcher)
@@ -1197,6 +1232,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         base_config()
         |> Keyword.put(:broadway_name, broadway_name)
         |> Keyword.put(:retry_deadline_ms, 60_000)
+
+      grpc_client = Keyword.get(opts, :grpc_client, BroadwayCloudPubSub.Streaming.GrpcClient)
+      {:ok, grpc_client_config} = grpc_client.init(opts)
+
+      opts =
+        opts
+        |> Keyword.put(:grpc_client, grpc_client)
+        |> Keyword.put(:grpc_client_config, grpc_client_config)
 
       rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
       batcher_name = Module.concat(broadway_name, AckBatcher)

@@ -277,6 +277,17 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       processing topology.
       """
     ],
+    grpc_client: [
+      type: :atom,
+      default: BroadwayCloudPubSub.Streaming.GrpcClient,
+      doc: """
+      The module implementing the `BroadwayCloudPubSub.Streaming.Client` behaviour.
+      Defaults to `BroadwayCloudPubSub.Streaming.GrpcClient`, which uses the
+      `grpc_client` library to communicate with Google Cloud Pub/Sub.
+
+      Swap this for testing or custom gRPC transports.
+      """
+    ],
 
     # Testing options
     test_pid: [type: :pid, doc: false]
