@@ -15,7 +15,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     AckBatcher,
     AckTimeDistribution,
     ErrorClassifier,
-    StreamReader
+    StreamReader,
+    Telemetry
   }
 
   alias Google.Pubsub.V1.StreamingPullRequest
@@ -202,7 +203,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         {:noreply, new_state}
 
       {:error, reason, new_state} ->
-        emit_telemetry(:connection_failure, %{reason: reason}, state.config)
+        emit_telemetry(:connection_failure, %{}, state.config, %{reason: reason})
         {:noreply, schedule_reconnect(new_state)}
     end
   end
@@ -360,18 +361,18 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
           "Terminal gRPC stream error on subscription #{state.config.subscription} - reason: #{inspect(error)}. Stopping StreamManager."
         )
 
-        emit_telemetry(:terminal_error, %{reason: error}, state.config)
+        emit_telemetry(:terminal_error, %{}, state.config, %{reason: error})
         {:stop, {:terminal_error, error}, close_stream(state)}
 
       :retryable ->
-        emit_telemetry(:disconnect, %{reason: error}, state.config)
+        emit_telemetry(:disconnect, %{}, state.config, %{reason: error})
         {:noreply, schedule_reconnect(reset_connection(state, error))}
     end
   end
 
   # Server closed the stream normally (StreamReader enumeration exhausted).
   def handle_info({:stream_closed}, state) do
-    emit_telemetry(:disconnect, %{reason: :stream_closed}, state.config)
+    emit_telemetry(:disconnect, %{}, state.config, %{reason: :stream_closed})
 
     # Stream ended naturally; nil out grpc_stream to skip cancel in close_stream/1.
     # See decisions.md for why cancelling after a server-initiated close crashes the Mint ConnectionProcess.
@@ -388,7 +389,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   # Only reconnect if grpc_stream is still set (stream_closed not yet processed).
   def handle_info({:EXIT, pid, :normal}, %{reader_pid: pid} = state) do
     if state.grpc_stream do
-      emit_telemetry(:disconnect, %{reason: :stream_closed}, state.config)
+      emit_telemetry(:disconnect, %{}, state.config, %{reason: :stream_closed})
       # Same rationale as {:stream_closed}: skip cancel on natural close.
       state = %{state | grpc_stream: nil}
 
@@ -405,7 +406,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   # StreamReader crashed — reconnect.
   def handle_info({:EXIT, pid, reason}, %{reader_pid: pid} = state) do
-    emit_telemetry(:disconnect, %{reason: reason}, state.config)
+    emit_telemetry(:disconnect, %{}, state.config, %{reason: reason})
     {:noreply, schedule_reconnect(reset_connection(state, reason))}
   end
 
@@ -440,7 +441,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   # Mint adapter signals connection loss.
   def handle_info({:elixir_grpc, :connection_down, conn_pid}, %{conn_pid: conn_pid} = state) do
-    emit_telemetry(:disconnect, %{reason: :connection_down}, state.config)
+    emit_telemetry(:disconnect, %{}, state.config, %{reason: :connection_down})
     {:noreply, schedule_reconnect(reset_connection(state, :connection_down))}
   end
 
@@ -449,7 +450,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         {:gun_down, conn_pid, _protocol, _reason, _killed_streams},
         %{conn_pid: conn_pid} = state
       ) do
-    emit_telemetry(:disconnect, %{reason: :connection_down}, state.config)
+    emit_telemetry(:disconnect, %{}, state.config, %{reason: :connection_down})
     {:noreply, schedule_reconnect(reset_connection(state, :connection_down))}
   end
 
@@ -976,16 +977,16 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   # --- Private: telemetry ---
 
-  defp emit_telemetry(event, measurements, config) do
-    metadata = %{
-      name: config.broadway[:name],
-      subscription: config.subscription
-    }
+  defp emit_telemetry(event, measurements, config, extra_metadata \\ %{}) do
+    metadata =
+      Map.merge(
+        %{
+          name: config.broadway[:name],
+          subscription: config.subscription
+        },
+        extra_metadata
+      )
 
-    :telemetry.execute(
-      [:broadway_cloud_pub_sub, :stream, event],
-      measurements,
-      metadata
-    )
+    Telemetry.execute(:stream, event, measurements, metadata, Map.get(config, :telemetry_metadata))
   end
 end

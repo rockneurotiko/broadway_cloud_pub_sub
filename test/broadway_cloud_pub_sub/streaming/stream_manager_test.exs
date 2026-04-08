@@ -4,7 +4,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   import ExUnit.CaptureLog
 
   alias BroadwayCloudPubSub.Streaming.{AckBatcher, StreamManager}
-  alias BroadwayCloudPubSub.Test.GrpcDynamicAdapter
+  alias BroadwayCloudPubSub.Test.{GrpcDynamicAdapter, TelemetryHelper}
 
   # Minimal config with enough keys to satisfy StreamManager.init/1
   # (mirrors what Options produces after validation + defaults).
@@ -94,6 +94,16 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   # Synchronous barrier: drains all prior mailbox messages in StreamManager
   # before returning. Safe to use instead of :sys.get_state/1 for sync purposes.
   defp sync(pid), do: StreamManager.get_buffered(pid)
+
+  # Drain all messages currently in the test process mailbox.
+  # Used to discard stray telemetry events emitted before we start asserting.
+  defp flush_mailbox do
+    receive do
+      _ -> flush_mailbox()
+    after
+      0 -> :ok
+    end
+  end
 
   # Build a minimal ReceivedMessage for sending into {:stream_messages, ...}.
   defp received_message(ack_id, data) do
@@ -463,16 +473,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
           :telemetry.attach(
             telemetry_name,
-            [:broadway_cloud_pub_sub, :stream, :terminal_error],
-            fn _event, measurements, _metadata, _config ->
-              send(test_pid, {:telemetry, :terminal_error, measurements})
-            end,
-            nil
+            [:broadway_cloud_pub_sub, :streaming, :stream, :terminal_error],
+            &TelemetryHelper.handle_event_forward_test/4,
+            %{pid: test_pid, msg: :telemetry_terminal_error}
           )
 
           send(pid, {:stream_error, %GRPC.RPCError{status: 5, message: "not found"}})
 
-          assert_receive {:telemetry, :terminal_error, %{reason: _}}, 1_000
+          assert_receive {:telemetry_terminal_error, %{}, %{reason: _}}, 1_000
 
           :telemetry.detach(telemetry_name)
         end)
@@ -481,6 +489,94 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
                "Terminal gRPC stream error on subscription projects/test/subscriptions/test-sub - reason: %GRPC.RPCError{status: 5, message: \"not found\", details: nil}. Stopping StreamManager."
     end
   end
+
+  describe "telemetry_metadata — :extra in stream event metadata" do
+    # We trigger a retryable stream error and observe the :disconnect event,
+    # which is emitted synchronously inside handle_info({:stream_error, ...})
+    # before any reconnect timer is scheduled. This avoids races with the
+    # :reconnect event that fires from the initial failed connection attempt.
+
+    test "static map is included under :extra in stream event metadata" do
+      extra = %{tenant_id: "acme", env: :prod}
+      test_pid = self()
+      telemetry_name = "test-extra-static-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :disconnect],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      pid = start_manager(telemetry_metadata: extra, backoff_min: 60_000, backoff_max: 60_000)
+      # Drain the first :connection_failure + reconnect from init before attaching.
+      sync(pid)
+      flush_mailbox()
+
+      # Trigger a :disconnect from a retryable stream error.
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      assert metadata.extra == extra
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "MFA is called and its return value is included under :extra" do
+      test_pid = self()
+      telemetry_name = "test-extra-mfa-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :disconnect],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      pid =
+        start_manager(
+          telemetry_metadata: {__MODULE__, :dynamic_meta, []},
+          backoff_min: 60_000,
+          backoff_max: 60_000
+        )
+
+      sync(pid)
+      flush_mailbox()
+
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      assert metadata.extra == %{dynamic: true}
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "no :extra key when telemetry_metadata is not set" do
+      test_pid = self()
+      telemetry_name = "test-no-extra-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :disconnect],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      pid = start_manager(backoff_min: 60_000, backoff_max: 60_000)
+      sync(pid)
+      flush_mailbox()
+
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      refute Map.has_key?(metadata, :extra)
+
+      :telemetry.detach(telemetry_name)
+    end
+  end
+
+  # MFA for telemetry_metadata test.
+  def dynamic_meta, do: %{dynamic: true}
 
   describe "retryable gRPC errors trigger reconnect" do
     test "DEADLINE_EXCEEDED (4) schedules reconnect without stopping" do

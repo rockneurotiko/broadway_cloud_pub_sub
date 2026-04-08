@@ -133,9 +133,17 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   ## Telemetry
 
   This producer emits the following [Telemetry](https://github.com/beam-telemetry/telemetry)
-  events. All events include metadata `%{name: broadway_name, subscription: subscription}`.
+  events. All events share the top-level prefix `[:broadway_cloud_pub_sub, :streaming]`,
+  followed by a layer sub-prefix.
 
-  ### Stream events (prefix: `[:broadway_cloud_pub_sub, :stream, ...]`)
+  All event metadata maps include an `:extra` key when the `:telemetry_metadata` option
+  is configured. Its value is the static term provided, or the return value of the MFA
+  called at emission time.
+
+  ### Stream events — `[:broadway_cloud_pub_sub, :streaming, :stream, ...]`
+
+  Emitted by `StreamManager`. Metadata: `%{name: broadway_name, subscription: subscription}`
+  (plus `:extra` when `:telemetry_metadata` is set).
 
     * `:connect` — gRPC StreamingPull stream successfully established.
 
@@ -143,7 +151,10 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
     * `:disconnect` — gRPC stream closed or errored.
 
-      Measurements: `%{reason: term()}`
+      Measurements: `%{}`
+
+      Metadata includes: `reason: term()` — the error or close reason
+      (e.g. a `GRPC.RPCError`, `:stream_closed`, `:connection_down`).
 
     * `:receive_messages` — messages received from the stream and forwarded to
       the producer.
@@ -157,35 +168,30 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     * `:terminal_error` — non-retryable gRPC error received. StreamManager stops
       after this event.
 
-      Measurements: `%{reason: term()}`
+      Measurements: `%{}`
+
+      Metadata includes: `reason: term()` — the terminal gRPC error.
 
     * `:connection_failure` — connection attempt failed before the stream was
-      established (unary RPC client).
-
-      Measurements: `%{reason: term()}`
-
-    * `:ack_failure` — an acknowledge RPC failed after retries (unary RPC client).
-
-      Measurements: `%{count: pos_integer()}`
-
-    * `:modack_failure` — a modifyAckDeadline RPC failed after retries (unary RPC client).
-
-      Measurements: `%{count: pos_integer()}`
-
-    * `:permanent_failure` — one or more ack_ids were permanently rejected by
-      the server (e.g. ack_id expired). These are dropped and not retried.
-
-      Measurements: `%{count: pos_integer()}`
-
-    * `:keepalive` — HTTP/2 PING frame sent on the gRPC connection to keep it
-      alive. Only emitted when using the `:gun` adapter.
+      established.
 
       Measurements: `%{}`
+
+      Metadata includes: `reason: term()` — the connection error.
+
+    * `:keepalive` — keep-alive ping sent on the gRPC connection.
+
+      Measurements: `%{deadline: pos_integer()}`
 
     * `:extend_leases` — lease extension cycle ran; modack requests dispatched
       for outstanding messages.
 
-      Measurements: `%{count: non_neg_integer()}`
+      Measurements: `%{count: non_neg_integer(), deadline: pos_integer()}`
+
+    * `:lease_expired` — outstanding messages dropped because they exceeded
+      `:max_extension_ms`.
+
+      Measurements: `%{count: pos_integer()}`
 
     * `:drain_timeout` — graceful shutdown drain timed out before all in-flight
       messages were processed.
@@ -201,10 +207,70 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
       Measurements: `%{delay: non_neg_integer()}`
 
-    * `:flush_deferred` — AckBatcher flush deferred because UnaryRpcClient was
-      not yet available (e.g. restarting).
+    * `:receipt_modack_stale` — pending exactly-once receipt modacks swept out
+      as stale and nacked for fast redelivery.
+
+      Measurements: `%{count: pos_integer()}`
+
+  ### AckBatcher events — `[:broadway_cloud_pub_sub, :streaming, :ack_batcher, ...]`
+
+  Emitted by `AckBatcher`. Metadata: `%{name: broadway_name, subscription: subscription}`
+  (plus `:extra` when `:telemetry_metadata` is set).
+
+    * `:flush_deferred` — flush deferred because UnaryRpcClient was not yet
+      available (e.g. restarting after a crash).
 
       Measurements: `%{ack_count: non_neg_integer(), modack_groups: non_neg_integer()}`
+
+    * `:modack_retry_exhausted` — modack ack_ids dropped after reaching the
+      maximum retry attempt count.
+
+      Measurements: `%{count: pos_integer()}`
+
+    * `:ack_retry_expired` — ack ack_ids dropped because they exceeded the
+      exactly-once retry deadline.
+
+      Measurements: `%{count: pos_integer()}`
+
+    * `:modack_retry_expired` — modack ack_ids dropped because they exceeded the
+      exactly-once retry deadline.
+
+      Measurements: `%{count: pos_integer()}`
+
+  ### Unary RPC client events — `[:broadway_cloud_pub_sub, :streaming, :unary, ...]`
+
+  Emitted by `UnaryRpcClient`. Metadata: `%{name: broadway_name, subscription: subscription}`
+  (plus `:extra` when `:telemetry_metadata` is set).
+
+    * `:connect` — unary RPC channel reconnected after a failure.
+
+      Measurements: `%{}`
+
+    * `:connection_failure` — unary RPC channel connect attempt failed.
+
+      Measurements: `%{}`
+
+      Metadata includes: `reason: term()` — the connection error.
+
+    * `:permanent_failure` — one or more ack_ids were permanently rejected by
+      the server (e.g. ack_id expired). These are dropped and not retried.
+
+      Measurements: `%{count: pos_integer()}`
+
+  ### gRPC client spans — `[:broadway_cloud_pub_sub, :streaming, :grpc_client, ...]`
+
+  Emitted by `GrpcClient` (the default `BroadwayCloudPubSub.Streaming.Client`
+  implementation) as `:telemetry.span/3` spans.
+  Metadata: `%{name: broadway_name, subscription: subscription, count: ack_count}`
+  (plus `:extra` when `:telemetry_metadata` is set).
+
+    * `:ack` — wraps each `Acknowledge` unary RPC call.
+
+      Events: `[:broadway_cloud_pub_sub, :streaming, :grpc_client, :ack, :start | :stop | :exception]`
+
+    * `:modack` — wraps each `ModifyAckDeadline` unary RPC call.
+
+      Events: `[:broadway_cloud_pub_sub, :streaming, :grpc_client, :modack, :start | :stop | :exception]`
 
   ## Pub/Sub Emulator
 
@@ -278,7 +344,8 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
         :ack_batch_interval_ms,
         :ack_batch_max_size,
         :retry_deadline_ms,
-        :grpc_client
+        :grpc_client,
+        :telemetry_metadata
       ])
       |> Keyword.put(:grpc_client_config, client_config)
       |> Keyword.put(:broadway_name, broadway_name)

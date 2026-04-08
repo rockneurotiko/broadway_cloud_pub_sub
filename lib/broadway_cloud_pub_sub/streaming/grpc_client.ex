@@ -14,21 +14,25 @@ defmodule BroadwayCloudPubSub.Streaming.GrpcClient do
 
   This module emits the following telemetry events:
 
-  * `[:broadway_cloud_pub_sub, :streaming, :ack, :start | :stop | :exception]` — emitted
-    as a span when sending an `Acknowledge` unary RPC.
+  * `[:broadway_cloud_pub_sub, :streaming, :grpc_client, :ack, :start | :stop | :exception]` —
+    emitted as a span when sending an `Acknowledge` unary RPC.
 
     Measurements: as described in `:telemetry.span/3`.
     Metadata: `%{name: broadway_name, subscription: subscription, count: ack_count}`
 
-  * `[:broadway_cloud_pub_sub, :streaming, :modack, :start | :stop | :exception]` — emitted
-    as a span when sending a `ModifyAckDeadline` unary RPC.
+  * `[:broadway_cloud_pub_sub, :streaming, :grpc_client, :modack, :start | :stop | :exception]` —
+    emitted as a span when sending a `ModifyAckDeadline` unary RPC.
 
     Measurements: as described in `:telemetry.span/3`.
     Metadata: `%{name: broadway_name, subscription: subscription, count: ack_count}`
+
+  Custom `BroadwayCloudPubSub.Streaming.Client` implementations that wish to emit
+  the same events should use the same event name prefix and metadata shape.
   """
 
   @behaviour BroadwayCloudPubSub.Streaming.Client
 
+  alias BroadwayCloudPubSub.Streaming.Telemetry
   alias Google.Pubsub.V1.Subscriber.Stub
   alias Google.Pubsub.V1.{AcknowledgeRequest, ModifyAckDeadlineRequest}
 
@@ -51,13 +55,10 @@ defmodule BroadwayCloudPubSub.Streaming.GrpcClient do
 
   @impl BroadwayCloudPubSub.Streaming.Client
   def disconnect(channel, _config) do
-    try do
-      GRPC.Stub.disconnect(channel)
-    catch
-      _, _ -> :ok
-    end
-
+    GRPC.Stub.disconnect(channel)
     :ok
+  catch
+    _, _ -> :ok
   end
 
   @impl BroadwayCloudPubSub.Streaming.Client
@@ -82,26 +83,27 @@ defmodule BroadwayCloudPubSub.Streaming.GrpcClient do
 
   @impl BroadwayCloudPubSub.Streaming.Client
   def cancel(stream, _config) do
-    try do
-      GRPC.Stub.cancel(stream)
-    catch
-      _, _ -> :ok
-    end
-
+    GRPC.Stub.cancel(stream)
     :ok
+  catch
+    _, _ -> :ok
   end
 
   @impl BroadwayCloudPubSub.Streaming.Client
   def acknowledge(channel, %AcknowledgeRequest{ack_ids: ack_ids} = request, config) do
-    :telemetry.span(
-      [:broadway_cloud_pub_sub, :streaming, :ack],
-      %{name: config.broadway_name, subscription: config.subscription},
+    count = length(ack_ids)
+    metadata = %{name: config.broadway_name, subscription: config.subscription, count: count}
+
+    Telemetry.span(
+      :grpc_client,
+      :ack,
+      metadata,
       fn ->
         result = Stub.acknowledge(channel, request, timeout: @unary_rpc_timeout_ms)
 
-        {result,
-         %{name: config.broadway_name, subscription: config.subscription, count: length(ack_ids)}}
-      end
+        {result, %{}}
+      end,
+      Map.get(config, :telemetry_metadata)
     )
   end
 
@@ -111,19 +113,21 @@ defmodule BroadwayCloudPubSub.Streaming.GrpcClient do
         %ModifyAckDeadlineRequest{ack_ids: ack_ids} = request,
         config
       ) do
-    :telemetry.span(
-      [:broadway_cloud_pub_sub, :streaming, :modack],
-      %{name: config.broadway_name, subscription: config.subscription},
+    count = length(ack_ids)
+    metadata = %{name: config.broadway_name, subscription: config.subscription, count: count}
+
+    Telemetry.span(
+      :grpc_client,
+      :modack,
+      metadata,
       fn ->
         result = Stub.modify_ack_deadline(channel, request, timeout: @unary_rpc_timeout_ms)
 
-        {result,
-         %{name: config.broadway_name, subscription: config.subscription, count: length(ack_ids)}}
-      end
+        {result, %{}}
+      end,
+      Map.get(config, :telemetry_metadata)
     )
   end
-
-  # --- Private ---
 
   defp fetch_token(%{token_generator: {mod, fun, args}}) do
     apply(mod, fun, args)

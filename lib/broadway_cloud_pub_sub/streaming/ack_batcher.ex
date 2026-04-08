@@ -7,12 +7,15 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
 
   use GenServer
 
-  alias BroadwayCloudPubSub.Streaming.UnaryRpcClient
+  alias BroadwayCloudPubSub.Streaming.{Telemetry, UnaryRpcClient}
 
   @max_modack_attempts 3
 
   defstruct [
     :rpc_client,
+    :broadway_name,
+    :subscription,
+    :telemetry_metadata,
     :batch_interval_ms,
     :batch_max_size,
     :timer_ref,
@@ -100,6 +103,9 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
 
     state = %__MODULE__{
       rpc_client: config.rpc_client,
+      broadway_name: config[:broadway_name],
+      subscription: config[:subscription],
+      telemetry_metadata: config[:telemetry_metadata],
       batch_interval_ms: config.ack_batch_interval_ms,
       batch_max_size: config.ack_batch_max_size,
       retry_deadline_ms: config[:retry_deadline_ms]
@@ -192,10 +198,10 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     # next timer tick to avoid a noproc crash while UnaryRpcClient is restarting.
     case GenServer.whereis(state.rpc_client) do
       nil ->
-        :telemetry.execute(
-          [:broadway_cloud_pub_sub, :stream, :flush_deferred],
+        emit_telemetry(
+          :flush_deferred,
           %{ack_count: state.ack_count, modack_groups: map_size(state.modack_ids)},
-          %{}
+          state
         )
 
         schedule_flush(state)
@@ -249,15 +255,15 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
             remaining
 
           {:ok, remaining_ids} ->
-            keep = apply_modack_retry_limit(remaining_ids, state.modack_attempts)
+            keep = apply_modack_retry_limit(remaining_ids, state.modack_attempts, state)
             if keep == [], do: remaining, else: Map.put(remaining, deadline, keep)
 
           {:error, {_rpc_error, transient_ids}} when is_list(transient_ids) ->
-            keep = apply_modack_retry_limit(transient_ids, state.modack_attempts)
+            keep = apply_modack_retry_limit(transient_ids, state.modack_attempts, state)
             if keep == [], do: remaining, else: Map.put(remaining, deadline, keep)
 
           {:error, _reason} ->
-            keep = apply_modack_retry_limit(ids, state.modack_attempts)
+            keep = apply_modack_retry_limit(ids, state.modack_attempts, state)
             if keep == [], do: remaining, else: Map.put(remaining, deadline, keep)
         end
       end)
@@ -282,16 +288,12 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
   end
 
   # Drops modack ids that have reached the maximum attempt count and emits telemetry.
-  defp apply_modack_retry_limit(ids, attempts) do
+  defp apply_modack_retry_limit(ids, attempts, state) do
     {keep, drop} =
       Enum.split_with(ids, fn id -> Map.get(attempts, id, 0) < @max_modack_attempts end)
 
     if drop != [] do
-      :telemetry.execute(
-        [:broadway_cloud_pub_sub, :stream, :modack_retry_exhausted],
-        %{count: length(drop)},
-        %{}
-      )
+      emit_telemetry(:modack_retry_exhausted, %{count: length(drop)}, state)
     end
 
     keep
@@ -322,11 +324,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
       end)
 
     if expired != [] do
-      :telemetry.execute(
-        [:broadway_cloud_pub_sub, :stream, :ack_retry_expired],
-        %{count: length(expired)},
-        %{}
-      )
+      emit_telemetry(:ack_retry_expired, %{count: length(expired)}, state)
     end
 
     clean_ts = Map.drop(state.ack_first_queued, expired)
@@ -353,11 +351,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
       end)
 
     if expired_count > 0 do
-      :telemetry.execute(
-        [:broadway_cloud_pub_sub, :stream, :modack_retry_expired],
-        %{count: expired_count},
-        %{}
-      )
+      emit_telemetry(:modack_retry_expired, %{count: expired_count}, state)
     end
 
     still_pending = remaining_modacks |> Map.values() |> List.flatten() |> MapSet.new()
@@ -394,5 +388,14 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     end
 
     %{state | timer_ref: nil}
+  end
+
+  defp emit_telemetry(event, measurements, state) do
+    metadata = %{
+      name: state.broadway_name,
+      subscription: state.subscription
+    }
+
+    Telemetry.execute(:ack_batcher, event, measurements, metadata, state.telemetry_metadata)
   end
 end

@@ -289,6 +289,25 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       """
     ],
 
+    telemetry_metadata: [
+      type: {:custom, __MODULE__, :type_telemetry_metadata, [[]]},
+      doc: """
+      Extra data to attach to every telemetry event emitted by the streaming
+      producer. The value is included in the event metadata under the `:extra`
+      key.
+
+      Accepts either:
+
+        * A static term (e.g. a map or keyword list) — stored once and
+          included verbatim in every event.
+        * An `{module, function, args}` tuple — called on every event
+          emission; its return value is used as the `:extra` value. Useful
+          for attaching dynamic data such as node names or runtime counters.
+
+      When not set, no `:extra` key is added to event metadata.
+      """
+    ],
+
     # Testing options
     test_pid: [type: :pid, doc: false]
   ]
@@ -391,4 +410,25 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
      "expected :#{name} to be :gun, :mint, or a module implementing GRPC.Client.Adapter, " <>
        "got: #{inspect(value)}"}
   end
+
+  @doc false
+  def type_telemetry_metadata({m, f, a}, _opts) when is_atom(m) and is_atom(f) and is_list(a) do
+    case Code.ensure_loaded(m) do
+      {:module, ^m} ->
+        if function_exported?(m, f, length(a)) do
+          {:ok, {m, f, a}}
+        else
+          {:error,
+           "expected :telemetry_metadata MFA to be an exported function, " <>
+             "but #{inspect(m)}.#{f}/#{length(a)} is not exported"}
+        end
+
+      {:error, _} ->
+        {:error,
+         "expected :telemetry_metadata MFA to reference a loaded module, " <>
+           "but #{inspect(m)} could not be loaded"}
+    end
+  end
+
+  def type_telemetry_metadata(term, _opts), do: {:ok, term}
 end

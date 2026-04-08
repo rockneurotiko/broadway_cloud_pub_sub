@@ -5,6 +5,7 @@ defmodule BroadwayCloudPubSub.PullClientTest do
 
   alias BroadwayCloudPubSub.Acknowledger
   alias BroadwayCloudPubSub.PullClient
+  alias BroadwayCloudPubSub.Test.TelemetryHelper
   alias Broadway.Message
 
   @pull_response """
@@ -295,29 +296,27 @@ defmodule BroadwayCloudPubSub.PullClientTest do
     end
 
     test "exposes telemetry for pull requests", %{opts: base_opts} do
+      test_pid = self()
+
       :telemetry.attach(
         :start_handler,
         [:broadway_cloud_pub_sub, :pull_client, :receive_messages, :start],
-        fn _name, _measurements, metadata, _config ->
-          send(self(), {:start, metadata})
-        end,
-        %{}
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :start}
       )
 
       :telemetry.attach(
         :stop_handler,
         [:broadway_cloud_pub_sub, :pull_client, :receive_messages, :stop],
-        fn _name, measurements, _metadata, _config ->
-          send(self(), {:stop, measurements})
-        end,
-        %{}
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :stop}
       )
 
       {:ok, opts} = base_opts |> Keyword.put(:max_number_of_messages, 5) |> PullClient.init()
       PullClient.receive_messages(10, & &1, opts)
 
-      assert_received {:start, metadata}
-      assert_received {:stop, measurements}
+      assert_received {:start, _measurements, metadata}
+      assert_received {:stop, measurements, _metadata}
       assert metadata.demand == 10
       assert metadata.max_messages == 5
       assert is_integer(measurements.duration)
@@ -380,29 +379,27 @@ defmodule BroadwayCloudPubSub.PullClientTest do
     end
 
     test "emits telemetry events", %{opts: base_opts} do
+      test_pid = self()
+
       :telemetry.attach(
         :start_handler,
         [:broadway_cloud_pub_sub, :pull_client, :ack, :start],
-        fn _name, _measurements, metadata, _config ->
-          send(self(), {:start, metadata})
-        end,
-        %{}
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :start}
       )
 
       :telemetry.attach(
         :stop_handler,
         [:broadway_cloud_pub_sub, :pull_client, :ack, :stop],
-        fn _name, measurements, metadata, _config ->
-          send(self(), {:stop, measurements, metadata})
-        end,
-        %{}
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :stop}
       )
 
       {:ok, opts} = PullClient.init(base_opts)
 
       PullClient.acknowledge(["1", "2", "3"], opts)
 
-      assert_received {:start, metadata}
+      assert_received {:start, _measurements, metadata}
       assert metadata.name == Broadway3
       assert_received {:stop, measurements, metadata}
       assert is_integer(measurements.duration)

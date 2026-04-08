@@ -32,7 +32,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   use GenServer
 
   alias BroadwayCloudPubSub.{Backoff}
-  alias BroadwayCloudPubSub.Streaming.{AckResult, ErrorClassifier}
+  alias BroadwayCloudPubSub.Streaming.{AckResult, ErrorClassifier, Telemetry}
   alias Google.Pubsub.V1.{AcknowledgeRequest, ModifyAckDeadlineRequest}
 
   require Logger
@@ -147,7 +147,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
         {:ok, %{state | channel: channel}}
 
       {:error, reason} ->
-        emit_telemetry(:connection_failure, %{reason: reason}, config)
+        emit_telemetry(:connection_failure, %{}, config, %{reason: reason})
         {:ok, state}
     end
   end
@@ -188,12 +188,6 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
                     state.config
                   )
                 end
-
-                emit_telemetry(
-                  :ack_failure,
-                  %{count: length(transient_ids), reason: error},
-                  state.config
-                )
 
                 state = schedule_reconnect(state)
                 {:reply, {:error, {error, transient_ids}}, state}
@@ -244,12 +238,6 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
                   )
                 end
 
-                emit_telemetry(
-                  :modack_failure,
-                  %{count: length(transient_ids), deadline: deadline_seconds, reason: error},
-                  state.config
-                )
-
                 state = schedule_reconnect(state)
                 {:reply, {:error, {error, transient_ids}}, state}
 
@@ -278,7 +266,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
         {:noreply, %{state | channel: channel, backoff: backoff}}
 
       {:error, reason} ->
-        emit_telemetry(:connection_failure, %{reason: reason}, state.config)
+        emit_telemetry(:connection_failure, %{}, state.config, %{reason: reason})
         {delay, new_backoff} = Backoff.backoff(state.backoff)
         Process.send_after(self(), :reconnect, delay || state.config.backoff_min)
         {:noreply, %{state | channel: nil, backoff: new_backoff, reconnect_pending: true}}
@@ -335,17 +323,17 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
     %{state | channel: nil}
   end
 
-  defp emit_telemetry(event, measurements, config) do
-    metadata = %{
-      name: config.broadway_name,
-      subscription: config.subscription
-    }
+  defp emit_telemetry(event, measurements, config, extra_metadata \\ %{}) do
+    metadata =
+      Map.merge(
+        %{
+          name: config.broadway_name,
+          subscription: config.subscription
+        },
+        extra_metadata
+      )
 
-    :telemetry.execute(
-      [:broadway_cloud_pub_sub, :unary, event],
-      measurements,
-      metadata
-    )
+    Telemetry.execute(:unary, event, measurements, metadata, Map.get(config, :telemetry_metadata))
   end
 
   # Splits ack_ids into {transient, permanent} based on per-ack-ID error details

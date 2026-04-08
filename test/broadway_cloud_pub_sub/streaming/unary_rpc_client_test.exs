@@ -2,7 +2,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClientTest do
   use ExUnit.Case, async: true
 
   alias BroadwayCloudPubSub.Streaming.UnaryRpcClient
-  alias BroadwayCloudPubSub.Test.GrpcDynamicAdapter
+  alias BroadwayCloudPubSub.Test.{GrpcDynamicAdapter, TelemetryHelper}
 
   # ============================================================
   # Chunking logic — pure caller-side, no GenServer needed
@@ -234,7 +234,69 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClientTest do
       assert is_atom(state.config.broadway_name)
       refute Map.has_key?(state.config, :broadway)
     end
+
+    test "static telemetry_metadata is emitted under :extra on connection_failure" do
+      test_pid = self()
+      extra = %{tenant_id: "acme"}
+      telemetry_name = "unary-extra-static-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :unary, :connection_failure],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      # start_client_no_channel triggers a :connection_failure on init
+      _pid = start_client_no_channel(telemetry_metadata: extra)
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      assert metadata.extra == extra
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "MFA telemetry_metadata is called and result is emitted under :extra" do
+      test_pid = self()
+      telemetry_name = "unary-extra-mfa-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :unary, :connection_failure],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      _pid = start_client_no_channel(telemetry_metadata: {__MODULE__, :dynamic_meta, []})
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      assert metadata.extra == %{dynamic: true}
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "no :extra key when telemetry_metadata is not set" do
+      test_pid = self()
+      telemetry_name = "unary-no-extra-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :unary, :connection_failure],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      _pid = start_client_no_channel()
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      refute Map.has_key?(metadata, :extra)
+
+      :telemetry.detach(telemetry_name)
+    end
   end
+
+  # MFA for telemetry_metadata test.
+  def dynamic_meta, do: %{dynamic: true}
 
   # ============================================================
   # handle_info(:reconnect) — async reconnect path

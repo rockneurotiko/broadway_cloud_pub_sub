@@ -2,6 +2,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
   use ExUnit.Case, async: true
 
   alias BroadwayCloudPubSub.Streaming.AckBatcher
+  alias BroadwayCloudPubSub.Test.TelemetryHelper
 
   # A spy GenServer that records every call it receives and forwards them to
   # the test process so we can assert on them. Returns :ok to all calls so
@@ -91,6 +92,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
       Keyword.merge(
         [
           rpc_client: rpc_pid,
+          broadway_name: :TestPipeline,
+          subscription: "projects/test/subscriptions/test-sub",
           ack_batch_interval_ms: 50,
           ack_batch_max_size: 10
         ],
@@ -573,6 +576,106 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
       refute "id-good" in remaining_ids
     end
   end
+
+  # ============================================================
+  # Telemetry metadata
+  # ============================================================
+
+  describe "telemetry_metadata" do
+    # Helper: start a batcher whose rpc_client is an atom that is never registered,
+    # so GenServer.whereis/1 returns nil and every flush is deferred — which reliably
+    # triggers the :flush_deferred telemetry event without needing to kill a process.
+    defp start_batcher_no_rpc(extra_opts \\ []) do
+      # Use a unique atom so concurrent tests don't share the same unregistered name.
+      rpc_name = Module.concat(__MODULE__, "NeverStarted#{System.unique_integer([:positive])}")
+
+      opts =
+        Keyword.merge(
+          [
+            rpc_client: rpc_name,
+            broadway_name: :TestPipeline,
+            subscription: "projects/test/subscriptions/test-sub",
+            ack_batch_interval_ms: 100_000,
+            ack_batch_max_size: 10_000
+          ],
+          extra_opts
+        )
+
+      {:ok, batcher} = AckBatcher.start_link(opts)
+      batcher
+    end
+
+    test "telemetry events include name and subscription in metadata" do
+      test_pid = self()
+      batcher = start_batcher_no_rpc()
+      telemetry_name = "batcher-meta-#{inspect(batcher)}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :ack_batcher, :flush_deferred],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      AckBatcher.ack(batcher, ["id-1"])
+      AckBatcher.flush(batcher)
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      assert metadata.name == :TestPipeline
+      assert metadata.subscription == "projects/test/subscriptions/test-sub"
+      refute Map.has_key?(metadata, :extra)
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "static telemetry_metadata is included under :extra" do
+      extra = %{tenant_id: "acme"}
+      test_pid = self()
+      batcher = start_batcher_no_rpc(telemetry_metadata: extra)
+      telemetry_name = "batcher-extra-static-#{inspect(batcher)}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :ack_batcher, :flush_deferred],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      AckBatcher.ack(batcher, ["id-1"])
+      AckBatcher.flush(batcher)
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      assert metadata.name == :TestPipeline
+      assert metadata.subscription == "projects/test/subscriptions/test-sub"
+      assert metadata.extra == extra
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "MFA telemetry_metadata is called and result is included under :extra" do
+      test_pid = self()
+      batcher = start_batcher_no_rpc(telemetry_metadata: {__MODULE__, :dynamic_meta, []})
+      telemetry_name = "batcher-extra-mfa-#{inspect(batcher)}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :ack_batcher, :flush_deferred],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :telemetry_meta}
+      )
+
+      AckBatcher.ack(batcher, ["id-1"])
+      AckBatcher.flush(batcher)
+
+      assert_receive {:telemetry_meta, _measurements, metadata}, 1_000
+      assert metadata.extra == %{dynamic: true}
+
+      :telemetry.detach(telemetry_name)
+    end
+  end
+
+  # MFA for telemetry_metadata test.
+  def dynamic_meta, do: %{dynamic: true}
 
   # ============================================================
   # Helpers

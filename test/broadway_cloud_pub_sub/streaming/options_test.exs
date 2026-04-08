@@ -319,4 +319,65 @@ defmodule BroadwayCloudPubSub.Streaming.OptionsTest do
                validate(subscription: "projects/p/subscriptions/s", enable_message_ordering: 1)
     end
   end
+
+  describe "telemetry_metadata" do
+    test "is optional — omitting it leaves the key absent" do
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s")
+      refute Keyword.has_key?(opts, :telemetry_metadata)
+    end
+
+    test "accepts a static map" do
+      {:ok, opts} =
+        validate(
+          subscription: "projects/p/subscriptions/s",
+          telemetry_metadata: %{tenant_id: "acme", env: :prod}
+        )
+
+      assert opts[:telemetry_metadata] == %{tenant_id: "acme", env: :prod}
+    end
+
+    test "accepts any static term (keyword list, atom, string)" do
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: [a: 1])
+      assert opts[:telemetry_metadata] == [a: 1]
+
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: :my_tag)
+      assert opts[:telemetry_metadata] == :my_tag
+
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: "label")
+      assert opts[:telemetry_metadata] == "label"
+    end
+
+    test "accepts a valid MFA tuple" do
+      {:ok, opts} =
+        validate(
+          subscription: "projects/p/subscriptions/s",
+          telemetry_metadata: {__MODULE__, :sample_meta, []}
+        )
+
+      assert opts[:telemetry_metadata] == {__MODULE__, :sample_meta, []}
+    end
+
+    test "rejects an MFA whose module is not loaded" do
+      assert {:error, err} =
+               validate(
+                 subscription: "projects/p/subscriptions/s",
+                 telemetry_metadata: {NotLoadedModuleXYZ, :some_fun, []}
+               )
+
+      assert Exception.message(err) =~ "could not be loaded"
+    end
+
+    test "rejects an MFA whose function is not exported" do
+      assert {:error, err} =
+               validate(
+                 subscription: "projects/p/subscriptions/s",
+                 telemetry_metadata: {__MODULE__, :nonexistent_fun, []}
+               )
+
+      assert Exception.message(err) =~ "not exported"
+    end
+  end
+
+  # Used in telemetry_metadata MFA tests above.
+  def sample_meta, do: %{node: node()}
 end
