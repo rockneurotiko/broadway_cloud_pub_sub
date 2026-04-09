@@ -19,6 +19,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
   definition = [
     # Handled by Broadway.
     broadway: [type: :any, doc: false],
+    broadway_name: [type: :atom, doc: false],
     subscription: [
       type: {:custom, __MODULE__, :type_non_empty_string, [[{:name, :subscription}]]},
       required: true,
@@ -277,6 +278,26 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       processing topology.
       """
     ],
+    interceptors: [
+      type: {:custom, __MODULE__, :type_interceptors, [[]]},
+      default: [],
+      doc: """
+      A list of client-side gRPC interceptors attached to every channel opened
+      by the producer (both the StreamingPull channel and the unary ack/modack channel).
+
+      Each entry is either a bare module or a `{module, opts}` tuple:
+
+        * `MyInterceptor` — calls `MyInterceptor.init([])` to initialise.
+        * `{MyInterceptor, level: :debug}` — calls `MyInterceptor.init(level: :debug)`.
+
+      Modules must implement the `GRPC.Client.Interceptor` behaviour (`init/1` and `call/4`).
+
+      ## Example
+
+          interceptors: [GRPC.Client.Interceptors.Logger]
+          interceptors: [{GRPC.Client.Interceptors.Logger, level: :warning}]
+      """
+    ],
     grpc_client: [
       type: :atom,
       default: BroadwayCloudPubSub.Streaming.GrpcClient,
@@ -288,7 +309,6 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       Swap this for testing or custom gRPC transports.
       """
     ],
-
     telemetry_metadata: [
       type: {:custom, __MODULE__, :type_telemetry_metadata, [[]]},
       doc: """
@@ -409,6 +429,42 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
     {:error,
      "expected :#{name} to be :gun, :mint, or a module implementing GRPC.Client.Adapter, " <>
        "got: #{inspect(value)}"}
+  end
+
+  def type_interceptors(list, _opts) when is_list(list) do
+    case Enum.find(Enum.map(list, &validate_interceptor/1), &match?({:error, _}, &1)) do
+      nil -> {:ok, list}
+      {:error, _} = err -> err
+    end
+  end
+
+  def type_interceptors(value, _opts) do
+    {:error, "expected :interceptors to be a list, got: #{inspect(value)}"}
+  end
+
+  defp validate_interceptor({mod, _opts}) when is_atom(mod), do: validate_interceptor_module(mod)
+  defp validate_interceptor(mod) when is_atom(mod), do: validate_interceptor_module(mod)
+
+  defp validate_interceptor(value) do
+    {:error,
+     "expected each interceptor to be a module or {module, opts} tuple, got: #{inspect(value)}"}
+  end
+
+  defp validate_interceptor_module(mod) do
+    case Code.ensure_loaded(mod) do
+      {:module, ^mod} ->
+        if function_exported?(mod, :init, 1) and function_exported?(mod, :call, 4) do
+          {:ok, mod}
+        else
+          {:error,
+           "expected interceptor #{inspect(mod)} to implement GRPC.Client.Interceptor " <>
+             "(init/1 and call/4), but one or both callbacks are missing"}
+        end
+
+      {:error, _} ->
+        {:error,
+         "expected interceptor to be a loaded module, but #{inspect(mod)} could not be loaded"}
+    end
   end
 
   @doc false

@@ -32,6 +32,39 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     modack_attempts: %{}
   ]
 
+  @all_keys [
+    :subscription,
+    :ack_batch_interval_ms,
+    :ack_batch_max_size,
+    :retry_deadline_ms,
+    :broadway_name,
+    :telemetry_metadata,
+    :rpc_client
+  ]
+
+  @required_keys [
+    :subscription,
+    :ack_batch_interval_ms,
+    :ack_batch_max_size,
+    :broadway_name,
+    :rpc_client
+  ]
+
+  @doc false
+  @spec child_opts(keyword()) :: keyword()
+  def child_opts(opts) do
+    picked = Keyword.take(opts, @all_keys)
+
+    Enum.each(@required_keys, fn key ->
+      unless Keyword.has_key?(picked, key) do
+        raise ArgumentError,
+              "missing required option #{inspect(key)} for #{inspect(__MODULE__)}"
+      end
+    end)
+
+    picked
+  end
+
   @doc """
   Updates the retry deadline at runtime. Called by StreamManager when it detects
   a change in exactly-once delivery status from subscription_properties.

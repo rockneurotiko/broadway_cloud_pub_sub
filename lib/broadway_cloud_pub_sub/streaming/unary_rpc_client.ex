@@ -52,6 +52,42 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
 
   # --- Public API ---
 
+  @all_keys [
+    :subscription,
+    :grpc_client,
+    :grpc_client_config,
+    :backoff_type,
+    :backoff_min,
+    :backoff_max,
+    :broadway_name,
+    :telemetry_metadata
+  ]
+
+  @required_keys [
+    :subscription,
+    :grpc_client,
+    :grpc_client_config,
+    :backoff_type,
+    :backoff_min,
+    :backoff_max,
+    :broadway_name
+  ]
+
+  @doc false
+  @spec child_opts(keyword()) :: keyword()
+  def child_opts(opts) do
+    picked = Keyword.take(opts, @all_keys)
+
+    Enum.each(@required_keys, fn key ->
+      unless Keyword.has_key?(picked, key) do
+        raise ArgumentError,
+              "missing required option #{inspect(key)} for #{inspect(__MODULE__)}"
+      end
+    end)
+
+    picked
+  end
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     {name, opts} = Keyword.pop(opts, :name)

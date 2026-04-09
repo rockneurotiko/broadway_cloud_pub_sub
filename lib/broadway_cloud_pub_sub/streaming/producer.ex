@@ -317,57 +317,33 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     opts =
       opts
       |> Keyword.put(:broadway, broadway_opts)
+      |> Keyword.put(:broadway_name, broadway_opts[:name])
       |> validate_options!()
       |> assign_client_id()
       |> assign_token_generator()
 
-    broadway_name = broadway_opts[:name]
+    broadway_name = opts[:broadway_name]
 
+    # Add grpc_client_config to be used by stream manager and unary
     grpc_client = opts[:grpc_client]
     {:ok, client_config} = grpc_client.init(opts)
 
     opts = Keyword.put(opts, :grpc_client_config, client_config)
 
-    # Config forwarded to UnaryRpcClient and AckBatcher via the supervisor.
-    # These keys are a subset of the full opts — only what the unary path needs.
-    unary_config =
-      opts
-      |> Keyword.take([
-        :subscription,
-        :token_generator,
-        :grpc_endpoint,
-        :use_ssl,
-        :adapter,
-        :backoff_type,
-        :backoff_min,
-        :backoff_max,
-        :ack_batch_interval_ms,
-        :ack_batch_max_size,
-        :retry_deadline_ms,
-        :grpc_client,
-        :telemetry_metadata
-      ])
-      |> Keyword.put(:grpc_client_config, client_config)
-      |> Keyword.put(:broadway_name, broadway_name)
-
-    sup_name = Module.concat(broadway_name, UnaryAckSupervisor)
+    # UnaryAckSupervisor options
+    unary_name = Module.concat(broadway_name, UnaryAckSupervisor)
+    unary_opts = Keyword.put(opts, :name, unary_name)
 
     unary_sup_spec = %{
-      id: sup_name,
-      start:
-        {UnaryAckSupervisor, :start_link,
-         [[name: sup_name, broadway_name: broadway_name, config: unary_config]]},
+      id: unary_name,
+      start: {UnaryAckSupervisor, :start_link, [unary_opts]},
       restart: :permanent,
       type: :supervisor
     }
 
-    # Pass broadway_name so StreamManager can derive the AckBatcher registered name.
+    # StreamManager options
     stream_manager_name = Module.concat(broadway_name, StreamManager)
-
-    manager_opts =
-      opts
-      |> Keyword.put(:name, stream_manager_name)
-      |> Keyword.put(:broadway_name, broadway_name)
+    manager_opts = Keyword.put(opts, :name, stream_manager_name)
 
     manager_spec = %{
       id: stream_manager_name,
@@ -375,6 +351,7 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
       restart: :permanent
     }
 
+    # Broadway options
     options =
       broadway_opts
       |> put_in([:producer, :module], {producer_module, opts})
@@ -436,17 +413,7 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
     # Nack buffered messages (not yet dispatched to processors) per on_shutdown config.
     buffered = StreamManager.get_buffered(manager_pid)
-
-    case {config[:on_shutdown], buffered} do
-      {_, []} ->
-        :ok
-
-      {:noop, _buffered_ids} ->
-        :ok
-
-      {{:nack, delay_seconds}, ack_ids} ->
-        StreamManager.modify_deadline(manager_pid, ack_ids, delay_seconds)
-    end
+    nack_ack_ids(manager_pid, config, buffered)
 
     # Stop receiving new messages and begin the drain phase.
     StreamManager.stop_receiving(manager_pid)
@@ -456,9 +423,16 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   @impl GenStage
   def terminate(_reason, state) do
-    %{manager_pid: manager_pid} = state
+    %{manager_pid: manager_pid, config: config} = state
 
     if Process.alive?(manager_pid) do
+      # Nack any messages still in outstanding so they are redelivered promptly
+      # instead of waiting for their ack deadline to expire naturally. This
+      # covers edge cases like on_failure: :noop (acknowledger does nothing) or
+      # the drain timeout firing before all processors complete.
+      outstanding = StreamManager.get_outstanding(manager_pid)
+      nack_ack_ids(manager_pid, config, outstanding)
+
       StreamManager.close(manager_pid)
     end
 
@@ -468,6 +442,16 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   end
 
   # --- Private ---
+
+  # Nack a list of ack_ids per the on_shutdown config. Used by both
+  # prepare_for_draining (for buffered messages) and terminate (for
+  # remaining outstanding messages).
+  defp nack_ack_ids(_manager_pid, _config, []), do: :ok
+  defp nack_ack_ids(_manager_pid, %{on_shutdown: :noop}, _ack_ids), do: :ok
+
+  defp nack_ack_ids(manager_pid, %{on_shutdown: {:nack, delay_seconds}}, ack_ids) do
+    StreamManager.modify_deadline(manager_pid, ack_ids, delay_seconds)
+  end
 
   defp validate_options!(opts) do
     case NimbleOptions.validate(opts, Options.definition()) do

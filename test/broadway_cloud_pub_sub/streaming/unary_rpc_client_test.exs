@@ -323,4 +323,84 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClientTest do
       assert state.channel == nil
     end
   end
+
+  # ============================================================
+  # child_opts/1
+  # ============================================================
+
+  describe "child_opts/1" do
+    @full_opts [
+      subscription: "projects/p/subscriptions/s",
+      grpc_client: BroadwayCloudPubSub.Streaming.GrpcClient,
+      grpc_client_config: %{},
+      backoff_type: :rand_exp,
+      backoff_min: 100,
+      backoff_max: 60_000,
+      broadway_name: MyPipeline,
+      telemetry_metadata: %{env: :test},
+      # Extra keys that UnaryRpcClient should NOT include
+      ack_batch_interval_ms: 100,
+      ack_batch_max_size: 2_500,
+      retry_deadline_ms: 60_000,
+      rpc_client: :some_rpc_client,
+      max_outstanding_messages: 1_000
+    ]
+
+    test "returns only the keys UnaryRpcClient needs" do
+      result = UnaryRpcClient.child_opts(@full_opts)
+
+      assert Keyword.keys(result) |> Enum.sort() ==
+               Enum.sort([
+                 :subscription,
+                 :grpc_client,
+                 :grpc_client_config,
+                 :backoff_type,
+                 :backoff_min,
+                 :backoff_max,
+                 :broadway_name,
+                 :telemetry_metadata
+               ])
+    end
+
+    test "excludes AckBatcher-specific keys" do
+      result = UnaryRpcClient.child_opts(@full_opts)
+
+      refute Keyword.has_key?(result, :ack_batch_interval_ms)
+      refute Keyword.has_key?(result, :ack_batch_max_size)
+      refute Keyword.has_key?(result, :retry_deadline_ms)
+      refute Keyword.has_key?(result, :rpc_client)
+      refute Keyword.has_key?(result, :max_outstanding_messages)
+    end
+
+    test "omits optional :telemetry_metadata when not provided" do
+      opts = Keyword.delete(@full_opts, :telemetry_metadata)
+      result = UnaryRpcClient.child_opts(opts)
+
+      refute Keyword.has_key?(result, :telemetry_metadata)
+    end
+
+    test "raises on missing required key :subscription" do
+      opts = Keyword.delete(@full_opts, :subscription)
+
+      assert_raise ArgumentError, ~r/missing required option :subscription/, fn ->
+        UnaryRpcClient.child_opts(opts)
+      end
+    end
+
+    test "raises on missing required key :grpc_client" do
+      opts = Keyword.delete(@full_opts, :grpc_client)
+
+      assert_raise ArgumentError, ~r/missing required option :grpc_client/, fn ->
+        UnaryRpcClient.child_opts(opts)
+      end
+    end
+
+    test "raises on missing required key :broadway_name" do
+      opts = Keyword.delete(@full_opts, :broadway_name)
+
+      assert_raise ArgumentError, ~r/missing required option :broadway_name/, fn ->
+        UnaryRpcClient.child_opts(opts)
+      end
+    end
+  end
 end

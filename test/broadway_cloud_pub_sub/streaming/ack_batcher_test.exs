@@ -702,4 +702,97 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
     assert result, "Expected :modify_ack_deadline with deadline #{deadline}"
     result
   end
+
+  # ============================================================
+  # child_opts/1
+  # ============================================================
+
+  describe "child_opts/1" do
+    @full_opts [
+      subscription: "projects/p/subscriptions/s",
+      ack_batch_interval_ms: 100,
+      ack_batch_max_size: 2_500,
+      retry_deadline_ms: 60_000,
+      broadway_name: MyPipeline,
+      telemetry_metadata: %{env: :test},
+      rpc_client: :some_rpc_client,
+      # Extra keys that AckBatcher should NOT include
+      grpc_client: BroadwayCloudPubSub.Streaming.GrpcClient,
+      grpc_client_config: %{},
+      backoff_type: :rand_exp,
+      backoff_min: 100,
+      backoff_max: 60_000,
+      max_outstanding_messages: 1_000
+    ]
+
+    test "returns only the keys AckBatcher needs" do
+      result = AckBatcher.child_opts(@full_opts)
+
+      assert Keyword.keys(result) |> Enum.sort() ==
+               Enum.sort([
+                 :subscription,
+                 :ack_batch_interval_ms,
+                 :ack_batch_max_size,
+                 :retry_deadline_ms,
+                 :broadway_name,
+                 :telemetry_metadata,
+                 :rpc_client
+               ])
+    end
+
+    test "excludes UnaryRpcClient-specific keys" do
+      result = AckBatcher.child_opts(@full_opts)
+
+      refute Keyword.has_key?(result, :grpc_client)
+      refute Keyword.has_key?(result, :grpc_client_config)
+      refute Keyword.has_key?(result, :backoff_type)
+      refute Keyword.has_key?(result, :backoff_min)
+      refute Keyword.has_key?(result, :backoff_max)
+      refute Keyword.has_key?(result, :max_outstanding_messages)
+    end
+
+    test "omits optional keys when not provided" do
+      opts =
+        @full_opts
+        |> Keyword.delete(:telemetry_metadata)
+        |> Keyword.delete(:retry_deadline_ms)
+
+      result = AckBatcher.child_opts(opts)
+
+      refute Keyword.has_key?(result, :telemetry_metadata)
+      refute Keyword.has_key?(result, :retry_deadline_ms)
+    end
+
+    test "raises on missing required key :subscription" do
+      opts = Keyword.delete(@full_opts, :subscription)
+
+      assert_raise ArgumentError, ~r/missing required option :subscription/, fn ->
+        AckBatcher.child_opts(opts)
+      end
+    end
+
+    test "raises on missing required key :rpc_client" do
+      opts = Keyword.delete(@full_opts, :rpc_client)
+
+      assert_raise ArgumentError, ~r/missing required option :rpc_client/, fn ->
+        AckBatcher.child_opts(opts)
+      end
+    end
+
+    test "raises on missing required key :broadway_name" do
+      opts = Keyword.delete(@full_opts, :broadway_name)
+
+      assert_raise ArgumentError, ~r/missing required option :broadway_name/, fn ->
+        AckBatcher.child_opts(opts)
+      end
+    end
+
+    test "raises on missing required key :ack_batch_interval_ms" do
+      opts = Keyword.delete(@full_opts, :ack_batch_interval_ms)
+
+      assert_raise ArgumentError, ~r/missing required option :ack_batch_interval_ms/, fn ->
+        AckBatcher.child_opts(opts)
+      end
+    end
+  end
 end

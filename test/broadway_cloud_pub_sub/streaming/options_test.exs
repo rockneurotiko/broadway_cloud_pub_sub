@@ -378,6 +378,146 @@ defmodule BroadwayCloudPubSub.Streaming.OptionsTest do
     end
   end
 
+  describe "interceptors" do
+    test "defaults to []" do
+      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s")
+      assert opts[:interceptors] == []
+    end
+
+    test "accepts a bare module list" do
+      {:ok, opts} =
+        validate(
+          subscription: "projects/p/subscriptions/s",
+          interceptors: [GRPC.Client.Interceptors.Logger]
+        )
+
+      assert opts[:interceptors] == [GRPC.Client.Interceptors.Logger]
+    end
+
+    test "accepts a {module, opts} tuple list" do
+      {:ok, opts} =
+        validate(
+          subscription: "projects/p/subscriptions/s",
+          interceptors: [{GRPC.Client.Interceptors.Logger, level: :warning}]
+        )
+
+      assert opts[:interceptors] == [{GRPC.Client.Interceptors.Logger, level: :warning}]
+    end
+
+    test "accepts a mixed list of bare modules and {module, opts} tuples" do
+      {:ok, opts} =
+        validate(
+          subscription: "projects/p/subscriptions/s",
+          interceptors: [
+            GRPC.Client.Interceptors.Logger,
+            {GRPC.Client.Interceptors.Logger, level: :debug}
+          ]
+        )
+
+      assert length(opts[:interceptors]) == 2
+    end
+
+    test "rejects a non-list value" do
+      assert {:error, err} =
+               validate(
+                 subscription: "projects/p/subscriptions/s",
+                 interceptors: GRPC.Client.Interceptors.Logger
+               )
+
+      assert Exception.message(err) =~ "interceptors"
+      assert Exception.message(err) =~ "list"
+    end
+
+    test "rejects an entry whose module is not loaded" do
+      assert {:error, err} =
+               validate(
+                 subscription: "projects/p/subscriptions/s",
+                 interceptors: [VeryUnlikelyToExist.InterceptorXYZ]
+               )
+
+      assert Exception.message(err) =~ "could not be loaded"
+    end
+
+    test "rejects an entry that is not a module or {module, opts} tuple" do
+      assert {:error, err} =
+               validate(
+                 subscription: "projects/p/subscriptions/s",
+                 interceptors: [:not_valid]
+               )
+
+      assert Exception.message(err) =~ "interceptor"
+    end
+
+    test "rejects a module that does not implement GRPC.Client.Interceptor" do
+      # String module is loaded but doesn't export init/1 or call/4
+      assert {:error, err} =
+               validate(
+                 subscription: "projects/p/subscriptions/s",
+                 interceptors: [String]
+               )
+
+      assert Exception.message(err) =~ "GRPC.Client.Interceptor"
+    end
+  end
+
   # Used in telemetry_metadata MFA tests above.
   def sample_meta, do: %{node: node()}
+end
+
+defmodule BroadwayCloudPubSub.Streaming.ProducerPrepareForStartTest do
+  use ExUnit.Case, async: true
+
+  alias BroadwayCloudPubSub.Streaming.Producer
+
+  # Minimal broadway_opts that satisfies prepare_for_start/2.
+  defp broadway_opts(producer_opts \\ []) do
+    base_producer_opts = [
+      subscription: "projects/test-project/subscriptions/test-sub",
+      token_generator: {__MODULE__, :noop_token, []},
+      grpc_endpoint: "localhost:8085",
+      use_ssl: false
+    ]
+
+    [
+      name: TestPipeline,
+      producer: [
+        module:
+          {Producer, Keyword.merge(base_producer_opts, producer_opts)},
+        concurrency: 1
+      ],
+      processors: [default: []]
+    ]
+  end
+
+  def noop_token, do: {:ok, "test-token"}
+
+  describe "prepare_for_start/2" do
+    test "grpc_client_config contains :broadway_name so GrpcClient telemetry does not crash" do
+      # GrpcClient.acknowledge/3 and modify_ack_deadline/3 read config.broadway_name
+      # from grpc_client_config for telemetry. This verifies that broadway_name is
+      # injected into opts *before* grpc_client.init/1 is called, so it ends up in
+      # the returned config map.
+      {_specs, updated_opts} = Producer.prepare_for_start(Producer, broadway_opts())
+
+      {_module, producer_opts} = updated_opts[:producer][:module]
+      grpc_client_config = producer_opts[:grpc_client_config]
+
+      assert is_map(grpc_client_config),
+             "expected grpc_client_config to be a map, got: #{inspect(grpc_client_config)}"
+
+      assert Map.has_key?(grpc_client_config, :broadway_name),
+             ":broadway_name missing from grpc_client_config — GrpcClient telemetry would crash"
+
+      assert grpc_client_config.broadway_name == TestPipeline
+    end
+
+    test "returns two child specs: UnaryAckSupervisor first, StreamManager second" do
+      {specs, _opts} = Producer.prepare_for_start(Producer, broadway_opts())
+
+      assert length(specs) == 2
+      [sup_spec, manager_spec] = specs
+      assert sup_spec.type == :supervisor
+      assert manager_spec[:type] == nil or manager_spec[:restart] == :permanent
+    end
+  end
 end

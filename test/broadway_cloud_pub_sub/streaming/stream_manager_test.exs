@@ -1483,4 +1483,57 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert msg.data == "data"
     end
   end
+
+  # ============================================================
+  # modify_deadline — non-zero deadline removes from outstanding
+  # ============================================================
+
+  describe "modify_deadline with non-zero deadline" do
+    test "removes ack_ids from outstanding (same as deadline=0)" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      # Push a message so it lands in outstanding
+      send(pid, {:stream_messages, [received_message("nack-5-ack", "data")]})
+      assert_receive {:stream_messages, [_]}, 500
+
+      state = :sys.get_state(pid)
+      assert Map.has_key?(state.outstanding, "nack-5-ack")
+
+      # Nack with non-zero deadline (e.g. on_shutdown default {:nack, 5})
+      StreamManager.modify_deadline(pid, ["nack-5-ack"], 5)
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.outstanding, "nack-5-ack")
+    end
+
+    test "non-zero nack during drain allows drain to complete" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      # Push a message so it lands in outstanding
+      send(pid, {:stream_messages, [received_message("drain-nack5", "data")]})
+      assert_receive {:stream_messages, [_]}, 500
+
+      # Enter drain mode
+      StreamManager.stop_receiving(pid)
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert state.draining
+      assert Map.has_key?(state.outstanding, "drain-nack5")
+      # Drain timer should be set (drain not yet complete)
+      assert state.drain_timer != nil
+
+      # Nack with non-zero deadline — should remove from outstanding and complete drain
+      StreamManager.modify_deadline(pid, ["drain-nack5"], 5)
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 0
+      # Drain should have completed: timer cancelled
+      assert state.drain_timer == nil
+    end
+  end
 end

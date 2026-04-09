@@ -34,21 +34,24 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryAckSupervisor do
   end
 
   @impl Supervisor
-  def init(opts) do
-    broadway_name = Keyword.fetch!(opts, :broadway_name)
-    config = Keyword.fetch!(opts, :config)
+  def init(config) do
+    broadway_name = Keyword.fetch!(config, :broadway_name)
 
     rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
     batcher_name = Module.concat(broadway_name, AckBatcher)
 
+    # Each child's child_opts/1 selects only the keys it needs from the
+    # full config and validates that all required keys are present.
     rpc_client_opts =
       config
+      |> UnaryRpcClient.child_opts()
       |> Keyword.put(:name, rpc_client_name)
 
     batcher_opts =
       config
-      |> Keyword.put(:name, batcher_name)
       |> Keyword.put(:rpc_client, rpc_client_name)
+      |> AckBatcher.child_opts()
+      |> Keyword.put(:name, batcher_name)
 
     children = [
       %{

@@ -138,6 +138,7 @@ defmodule BroadwayCloudPubSub.Streaming.GrpcClient do
          token
        ) do
     keepalive_interval_ms = Map.get(config, :keepalive_interval_ms, 30_000)
+    interceptors = Map.get(config, :interceptors, [])
 
     adapter_opts = [http2_opts: %{keepalive: keepalive_interval_ms, settings_timeout: :infinity}]
 
@@ -150,7 +151,8 @@ defmodule BroadwayCloudPubSub.Streaming.GrpcClient do
     base_opts = [
       adapter: adapter,
       headers: [{"authorization", "Bearer #{token}"}],
-      adapter_opts: adapter_opts
+      adapter_opts: adapter_opts,
+      interceptors: interceptors
     ]
 
     opts =

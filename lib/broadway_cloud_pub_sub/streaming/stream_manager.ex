@@ -492,29 +492,25 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   def handle_cast({:modify_deadline, ack_ids, deadline_seconds}, state) do
     now = now_ms()
 
-    # On nack (deadline == 0), record processing times and remove from outstanding
-    # so they are not lease-extended further. On non-zero deadline changes,
-    # keep the ack_ids in outstanding unchanged.
-    {new_outstanding, ack_time_dist} =
-      if deadline_seconds == 0 do
-        dist =
-          Enum.reduce(ack_ids, state.ack_time_dist, fn ack_id, acc ->
-            case Map.get(state.outstanding, ack_id) do
-              %{received_at: received_at} ->
-                duration_s = max(1, div(now - received_at, 1_000))
-                AckTimeDistribution.record(acc, duration_s)
+    # Record processing times and remove from outstanding for all deadline
+    # modifications (both nack with deadline=0 and nack with deadline>0).
+    # Once a message has been nacked, it must not be lease-extended further —
+    # otherwise the periodic extend_leases cycle would override the requested
+    # deadline, and the drain phase could never complete because outstanding
+    # would never become empty.
+    ack_time_dist =
+      Enum.reduce(ack_ids, state.ack_time_dist, fn ack_id, acc ->
+        case Map.get(state.outstanding, ack_id) do
+          %{received_at: received_at} ->
+            duration_s = max(1, div(now - received_at, 1_000))
+            AckTimeDistribution.record(acc, duration_s)
 
-              nil ->
-                acc
-            end
-          end)
+          nil ->
+            acc
+        end
+      end)
 
-        outstanding = Enum.reduce(ack_ids, state.outstanding, &Map.delete(&2, &1))
-        {outstanding, dist}
-      else
-        {state.outstanding, state.ack_time_dist}
-      end
-
+    new_outstanding = Enum.reduce(ack_ids, state.outstanding, &Map.delete(&2, &1))
     state = %{state | outstanding: new_outstanding, ack_time_dist: ack_time_dist}
 
     AckBatcher.modack(state.ack_batcher, ack_ids, deadline_seconds)
@@ -987,6 +983,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         extra_metadata
       )
 
-    Telemetry.execute(:stream, event, measurements, metadata, Map.get(config, :telemetry_metadata))
+    Telemetry.execute(
+      :stream,
+      event,
+      measurements,
+      metadata,
+      Map.get(config, :telemetry_metadata)
+    )
   end
 end
