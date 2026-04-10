@@ -84,16 +84,25 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         ack_batch_max_size: Keyword.get(opts, :ack_batch_max_size, 2_500)
       )
 
-    {:ok, pid} = StreamManager.start_link(opts)
+    # Pass producer_pid and ack_ref directly (matching what Producer.init does)
+    opts =
+      opts
+      |> Keyword.put(:producer_pid, self())
+      |> Keyword.put(:ack_ref, {broadway_name, 0})
 
-    StreamManager.set_producer(pid, self())
+    {:ok, pid} = StreamManager.start_link(opts)
 
     pid
   end
 
   # Synchronous barrier: drains all prior mailbox messages in StreamManager
-  # before returning. Safe to use instead of :sys.get_state/1 for sync purposes.
-  defp sync(pid), do: StreamManager.get_buffered(pid)
+  # before returning. Uses get_outstanding (a GenServer.call) to guarantee ordering.
+  defp sync(pid), do: StreamManager.get_outstanding(pid)
+
+  # Returns the number of messages currently in the StreamManager's message_buffer.
+  defp buffer_length(pid) do
+    :queue.len(:sys.get_state(pid).message_buffer)
+  end
 
   # Drain all messages currently in the test process mailbox.
   # Used to discard stray telemetry events emitted before we start asserting.
@@ -155,7 +164,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert_receive {:stream_messages, [_]}, 500
 
       # Buffer is empty: all demand was consumed by the forwarded message
-      assert StreamManager.get_buffered(pid) == []
+      assert buffer_length(pid) == 0
     end
   end
 
@@ -167,8 +176,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       StreamManager.notify_demand(pid, 0)
       send(pid, {:stream_messages, [received_message("buf-1", "msg1")]})
       send(pid, {:stream_messages, [received_message("buf-2", "msg2")]})
-      # Wait for both to be buffered (sync via get_buffered)
-      assert length(StreamManager.get_buffered(pid)) == 2
+      # Wait for both to be buffered (sync via buffer_length)
+      assert buffer_length(pid) == 2
 
       # Now demand arrives — should flush both at once
       StreamManager.notify_demand(pid, 10)
@@ -177,7 +186,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert Enum.map(received, & &1.data) == ["msg1", "msg2"]
 
       # Buffer should be empty; remaining demand consumed 2 of 10
-      assert StreamManager.get_buffered(pid) == []
+      assert buffer_length(pid) == 0
     end
 
     test "flushes only up to pending_demand, keeps remainder buffered" do
@@ -190,7 +199,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         send(pid, {:stream_messages, [received_message("buf-#{i}", "msg#{i}")]})
       end
 
-      assert length(StreamManager.get_buffered(pid)) == 5
+      assert buffer_length(pid) == 5
 
       # Demand for 2 — should flush exactly 2
       StreamManager.notify_demand(pid, 2)
@@ -200,7 +209,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert Enum.map(received, & &1.data) == ["msg1", "msg2"]
 
       # 3 remain buffered
-      assert length(StreamManager.get_buffered(pid)) == 3
+      assert buffer_length(pid) == 3
 
       # Demand for 10 — should flush the remaining 3
       StreamManager.notify_demand(pid, 10)
@@ -209,7 +218,63 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert length(received2) == 3
       assert Enum.map(received2, & &1.data) == ["msg3", "msg4", "msg5"]
 
-      assert StreamManager.get_buffered(pid) == []
+      assert buffer_length(pid) == 0
+    end
+  end
+
+  describe "notify_demand/2 — delta accumulation (regression for over-delivery bug)" do
+    test "demand deltas accumulate correctly when interleaved with message flushes" do
+      pid = start_manager()
+
+      # 1. Signal demand delta of 10 → pending_demand should be 10
+      StreamManager.notify_demand(pid, 10)
+      sync(pid)
+      assert :sys.get_state(pid).pending_demand == 10
+
+      # 2. StreamManager receives and flushes 5 messages → pending_demand should be 5
+      msgs = for i <- 1..5, do: received_message("race-#{i}", "msg#{i}")
+      send(pid, {:stream_messages, msgs})
+      assert_receive {:stream_messages, flushed}, 500
+      assert length(flushed) == 5
+      sync(pid)
+      assert :sys.get_state(pid).pending_demand == 5
+
+      # 3. Signal another demand delta of 5 → pending_demand should be 5 + 5 = 10
+      #    BUG: with absolute overwrite semantics, pending_demand becomes 5 instead of 10,
+      #    effectively "forgetting" the 5 units of remaining demand from step 1.
+      StreamManager.notify_demand(pid, 5)
+      sync(pid)
+      assert :sys.get_state(pid).pending_demand == 10
+    end
+
+    test "over-delivery is prevented when demand arrives after flush" do
+      pid = start_manager()
+
+      # Signal demand delta of 3
+      StreamManager.notify_demand(pid, 3)
+      sync(pid)
+
+      # StreamManager receives and flushes 3 messages → pending_demand = 0
+      msgs = for i <- 1..3, do: received_message("od-#{i}", "msg#{i}")
+      send(pid, {:stream_messages, msgs})
+      assert_receive {:stream_messages, flushed}, 500
+      assert length(flushed) == 3
+      sync(pid)
+      assert :sys.get_state(pid).pending_demand == 0
+
+      # Signal new demand delta of 2 → should accumulate to 0 + 2 = 2
+      StreamManager.notify_demand(pid, 2)
+      sync(pid)
+      assert :sys.get_state(pid).pending_demand == 2
+
+      # Now 5 messages arrive — only 2 should be flushed (the rest buffered)
+      msgs2 = for i <- 6..10, do: received_message("od-#{i}", "msg#{i}")
+      send(pid, {:stream_messages, msgs2})
+      assert_receive {:stream_messages, flushed2}, 500
+      assert length(flushed2) == 2
+
+      # 3 should remain buffered
+      assert buffer_length(pid) == 3
     end
   end
 
@@ -225,7 +290,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert hd(messages).data == "hello"
 
       # Buffer should be empty (demand consumed the message immediately)
-      assert StreamManager.get_buffered(pid) == []
+      assert buffer_length(pid) == 0
     end
 
     test "messages are buffered when pending_demand is 0" do
@@ -236,7 +301,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       refute_receive {:stream_messages, _}, 100
 
-      assert length(StreamManager.get_buffered(pid)) == 1
+      assert buffer_length(pid) == 1
     end
 
     test "buffer is flushed in FIFO order on notify_demand" do
@@ -248,7 +313,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       end
 
       # Sync: ensure all 3 are buffered before we signal demand
-      assert length(StreamManager.get_buffered(pid)) == 3
+      assert buffer_length(pid) == 3
 
       StreamManager.notify_demand(pid, 10)
 
@@ -258,19 +323,347 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   end
 
   # ============================================================
-  # receiving flag — draining
+  # draining
   # ============================================================
 
-  describe "stop_receiving/1" do
-    test "messages are not forwarded after stop_receiving even when pending_demand > 0" do
+  describe "prepare_for_draining/1" do
+    test "messages are not forwarded after prepare_for_draining even when pending_demand > 0" do
       pid = start_manager()
 
       StreamManager.notify_demand(pid, 10)
-      StreamManager.stop_receiving(pid)
+      StreamManager.prepare_for_draining(pid)
 
       send(pid, {:stream_messages, [received_message("drain-ack", "should not arrive")]})
 
       refute_receive {:stream_messages, _}, 200
+    end
+
+    test "clears message_buffer and removes buffered ack_ids from outstanding" do
+      pid = start_manager()
+
+      # Buffer 3 messages with demand=0
+      StreamManager.notify_demand(pid, 0)
+
+      for i <- 1..3 do
+        send(pid, {:stream_messages, [received_message("buf-drain-#{i}", "data-#{i}")]})
+      end
+
+      assert buffer_length(pid) == 3
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 3
+
+      # prepare_for_draining should nack + clear buffer + remove from outstanding
+      {:ok, nacked_count} = StreamManager.prepare_for_draining(pid)
+      assert nacked_count == 3
+
+      state = :sys.get_state(pid)
+      assert buffer_length(pid) == 0
+      assert map_size(state.outstanding) == 0
+      assert state.draining == true
+    end
+
+    test "with on_shutdown :noop, clears buffer without nacking" do
+      pid = start_manager(on_shutdown: :noop)
+
+      StreamManager.notify_demand(pid, 0)
+      send(pid, {:stream_messages, [received_message("noop-buf", "data")]})
+      assert buffer_length(pid) == 1
+
+      {:ok, nacked_count} = StreamManager.prepare_for_draining(pid)
+      assert nacked_count == 1
+
+      state = :sys.get_state(pid)
+      assert buffer_length(pid) == 0
+      assert map_size(state.outstanding) == 0
+    end
+
+    test "flush_demand is blocked after draining starts" do
+      pid = start_manager()
+
+      # Start draining with empty buffer
+      StreamManager.prepare_for_draining(pid)
+
+      # Manually inject a message into the buffer via replace_state
+      # (simulating a race condition where a message arrives after draining)
+      :sys.replace_state(pid, fn s ->
+        fake_msg = %Broadway.Message{
+          data: "sneaky",
+          metadata: %{},
+          acknowledger:
+            {BroadwayCloudPubSub.Streaming.Acknowledger, :unused, %{ack_id: "after-drain"}}
+        }
+
+        %{s | message_buffer: :queue.in(fake_msg, s.message_buffer)}
+      end)
+
+      assert buffer_length(pid) == 1
+
+      # Demand arrives — flush_demand should be a no-op because draining=true
+      StreamManager.notify_demand(pid, 10)
+      refute_receive {:stream_messages, _}, 200
+
+      # Buffer should still have the message (not flushed)
+      assert buffer_length(pid) == 1
+    end
+
+    test "preserves in-flight messages in outstanding (only clears buffered)" do
+      pid = start_manager()
+
+      # Send 3 messages with demand so they go straight to processor (in-flight)
+      StreamManager.notify_demand(pid, 10)
+
+      for i <- 1..3 do
+        send(pid, {:stream_messages, [received_message("inflight-#{i}", "data-#{i}")]})
+      end
+
+      assert_receive {:stream_messages, _}, 500
+
+      # Zero out pending_demand so subsequent messages are buffered
+      :sys.replace_state(pid, fn s -> %{s | pending_demand: 0} end)
+      send(pid, {:stream_messages, [received_message("buf-a", "buf-data-a")]})
+      send(pid, {:stream_messages, [received_message("buf-b", "buf-data-b")]})
+      assert buffer_length(pid) == 2
+
+      state = :sys.get_state(pid)
+      # 5 total outstanding: 3 in-flight + 2 buffered
+      assert map_size(state.outstanding) == 5
+
+      {:ok, nacked_count} = StreamManager.prepare_for_draining(pid)
+      assert nacked_count == 2
+
+      state = :sys.get_state(pid)
+      assert buffer_length(pid) == 0
+      # Only the 3 in-flight messages remain in outstanding
+      assert map_size(state.outstanding) == 3
+      assert Map.has_key?(state.outstanding, "inflight-1")
+      assert Map.has_key?(state.outstanding, "inflight-2")
+      assert Map.has_key?(state.outstanding, "inflight-3")
+    end
+
+    test "drain completes immediately when no in-flight messages remain" do
+      pid = start_manager()
+
+      # Buffer only (no demand → nothing dispatched to processors)
+      StreamManager.notify_demand(pid, 0)
+      send(pid, {:stream_messages, [received_message("only-buf", "data")]})
+      assert buffer_length(pid) == 1
+
+      {:ok, 1} = StreamManager.prepare_for_draining(pid)
+
+      state = :sys.get_state(pid)
+      # outstanding is empty → drain should have completed
+      assert map_size(state.outstanding) == 0
+      # drain_timer should be cancelled since drain completed
+      assert state.drain_timer == nil
+    end
+  end
+
+  # ============================================================
+  # Draining behavior — handler guards
+  # ============================================================
+
+  describe "draining — stream_messages handler" do
+    test "messages arriving during drain are not delivered to the producer" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+      StreamManager.prepare_for_draining(pid)
+
+      send(pid, {:stream_messages, [received_message("late-msg", "data")]})
+      sync(pid)
+
+      refute_receive {:stream_messages, _}, 100
+    end
+
+    test "messages arriving during drain are not added to outstanding" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+      StreamManager.prepare_for_draining(pid)
+
+      outstanding_before = map_size(:sys.get_state(pid).outstanding)
+
+      send(pid, {:stream_messages, [received_message("late-msg", "data")]})
+      sync(pid)
+
+      # Outstanding should not grow
+      assert map_size(:sys.get_state(pid).outstanding) == outstanding_before
+    end
+  end
+
+  describe "draining — reconnect suppression" do
+    test ":connect during drain is ignored (no reconnection)" do
+      pid = start_manager()
+      StreamManager.prepare_for_draining(pid)
+
+      # Manually set a reconnect_ref to simulate a pending reconnect
+      :sys.replace_state(pid, fn s -> %{s | reconnect_ref: make_ref()} end)
+
+      send(pid, :connect)
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      # reconnect_ref should be cleared but no new connection started
+      assert state.reconnect_ref == nil
+      assert state.reader_pid == nil
+    end
+
+    test "retryable stream_error during drain does not schedule reconnect" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+      StreamManager.prepare_for_draining(pid)
+
+      # Cancel any existing reconnect timer from initial connect failure
+      :sys.replace_state(pid, fn s ->
+        if s.reconnect_ref, do: Process.cancel_timer(s.reconnect_ref)
+        %{s | reconnect_ref: nil}
+      end)
+
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      # No new reconnect scheduled during drain
+      assert state.reconnect_ref == nil
+      assert state.reader_pid == nil
+      assert Process.alive?(pid)
+    end
+
+    test "terminal stream_error during drain does not crash (no stop)" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+      StreamManager.prepare_for_draining(pid)
+
+      send(pid, {:stream_error, %GRPC.RPCError{status: 5, message: "not found"}})
+      sync(pid)
+
+      # During drain, terminal errors don't stop the GenServer
+      assert Process.alive?(pid)
+    end
+  end
+
+  describe "draining — receipt_modack_result" do
+    test "receipt_modack_result during drain nacks rather than delivers" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["eo-drain"], %{"eo-drain" => "data"})
+      assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 1
+
+      # Enter drain mode (this clears pending_receipt_modacks normally,
+      # but let's inject after drain to simulate the race)
+      StreamManager.prepare_for_draining(pid)
+
+      # Re-inject to simulate a receipt_modack_result arriving after drain started
+      # but for a ref that was in-flight before drain
+      ref2 = make_ref()
+      inject_pending_receipt_modack(pid, ref2, ["eo-late"], %{"eo-late" => "late-data"})
+
+      # Result arrives during drain
+      send(pid, {:receipt_modack_result, ref2, {:ok, []}})
+      sync(pid)
+
+      # Message should NOT be delivered
+      refute_receive {:stream_messages, _}, 100
+
+      # pending_receipt_modacks should be cleared for this ref
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.pending_receipt_modacks, ref2)
+
+      # Message should NOT be added to outstanding
+      refute Map.has_key?(state.outstanding, "eo-late")
+    end
+  end
+
+  # ============================================================
+  # Drain timeout
+  # ============================================================
+
+  describe "drain_timeout nacks outstanding messages" do
+    test "drain_timeout nacks all outstanding (in-flight) messages" do
+      # Use a very short drain timeout so the test doesn't have to wait long.
+      pid = start_manager(drain_timeout_ms: 50)
+
+      # Dispatch 3 messages with demand so they become in-flight (outstanding).
+      StreamManager.notify_demand(pid, 10)
+
+      for i <- 1..3 do
+        send(pid, {:stream_messages, [received_message("inflight-#{i}", "data-#{i}")]})
+      end
+
+      assert_receive {:stream_messages, _}, 500
+      assert_receive {:stream_messages, _}, 500
+      assert_receive {:stream_messages, _}, 500
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 3
+
+      # Drain — buffered is empty, so only in-flight messages remain in outstanding.
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      state = :sys.get_state(pid)
+      assert state.draining == true
+      # The 3 in-flight messages should still be in outstanding.
+      assert map_size(state.outstanding) == 3
+      # Drain timer should be set.
+      assert state.drain_timer != nil
+
+      # Wait for drain_timeout to fire (50ms + some margin).
+      Process.sleep(150)
+
+      state = :sys.get_state(pid)
+      # After drain_timeout, outstanding should be empty (messages were nacked).
+      assert map_size(state.outstanding) == 0
+      # Drain timer should be cleared.
+      assert state.drain_timer == nil
+    end
+
+    test "drain_timeout with on_shutdown :noop clears outstanding without nacking" do
+      pid = start_manager(drain_timeout_ms: 50, on_shutdown: :noop)
+
+      # Dispatch messages to make them in-flight.
+      StreamManager.notify_demand(pid, 10)
+      send(pid, {:stream_messages, [received_message("noop-inflight", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      assert map_size(:sys.get_state(pid).outstanding) == 1
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      # Wait for drain_timeout.
+      Process.sleep(150)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 0
+      assert state.drain_timer == nil
+    end
+
+    test "drain completes before timeout when all messages are acked" do
+      pid = start_manager(drain_timeout_ms: 5_000)
+
+      # Dispatch 2 messages.
+      StreamManager.notify_demand(pid, 10)
+      send(pid, {:stream_messages, [received_message("ack-1", "data-1")]})
+      send(pid, {:stream_messages, [received_message("ack-2", "data-2")]})
+      assert_receive {:stream_messages, _}, 500
+      assert_receive {:stream_messages, _}, 500
+
+      assert map_size(:sys.get_state(pid).outstanding) == 2
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      state = :sys.get_state(pid)
+      assert state.draining == true
+      assert state.drain_timer != nil
+
+      # Simulate processors finishing and acking both messages.
+      StreamManager.acknowledge(pid, ["ack-1", "ack-2"])
+      # Sync to ensure the cast is processed.
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      # Drain completed early — outstanding empty, timer cancelled.
+      assert map_size(state.outstanding) == 0
+      assert state.drain_timer == nil
     end
   end
 
@@ -1025,8 +1418,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         ack_batch_max_size: Keyword.get(opts, :ack_batch_max_size, 2_500)
       )
 
+    opts =
+      opts
+      |> Keyword.put(:producer_pid, self())
+      |> Keyword.put(:ack_ref, {broadway_name, 0})
+
     {:ok, pid} = StreamManager.start_link(opts)
-    StreamManager.set_producer(pid, self())
 
     {pid, rpc_pid}
   end
@@ -1244,8 +1641,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
           retry_deadline_ms: 60_000
         )
 
+      opts =
+        opts
+        |> Keyword.put(:producer_pid, self())
+        |> Keyword.put(:ack_ref, {broadway_name, 0})
+
       {:ok, pid} = StreamManager.start_link(opts)
-      StreamManager.set_producer(pid, self())
 
       batcher_pid = Process.whereis(batcher_name)
       assert :sys.get_state(batcher_pid).retry_deadline_ms == 60_000
@@ -1297,8 +1698,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
           retry_deadline_ms: 60_000
         )
 
+      opts =
+        opts
+        |> Keyword.put(:producer_pid, self())
+        |> Keyword.put(:ack_ref, {broadway_name, 0})
+
       {:ok, pid} = StreamManager.start_link(opts)
-      StreamManager.set_producer(pid, self())
 
       batcher_pid = Process.whereis(batcher_name)
 
@@ -1350,8 +1755,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
           ack_batch_max_size: 2_500
         )
 
+      opts =
+        opts
+        |> Keyword.put(:producer_pid, self())
+        |> Keyword.put(:ack_ref, {broadway_name, 0})
+
       {:ok, pid} = StreamManager.start_link(opts)
-      StreamManager.set_producer(pid, self())
 
       batcher_pid = Process.whereis(batcher_name)
       initial_deadline = :sys.get_state(batcher_pid).retry_deadline_ms
@@ -1414,14 +1823,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
   end
 
   describe "exactly-once — drain nack pending receipt modacks" do
-    test "pending receipt modacks are nacked on stop_receiving" do
+    test "pending receipt modacks are nacked on prepare_for_draining" do
       pid = start_manager()
 
       ref = make_ref()
       inject_pending_receipt_modack(pid, ref, ["drain-eo"], %{"drain-eo" => "data"})
       assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 1
 
-      StreamManager.stop_receiving(pid)
+      StreamManager.prepare_for_draining(pid)
       sync(pid)
 
       # After drain, pending_receipt_modacks should be cleared
@@ -1436,7 +1845,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       inject_pending_receipt_modack(pid, ref, ["drain-stale"], %{"drain-stale" => "data"})
 
       # Drain clears the pending map
-      StreamManager.stop_receiving(pid)
+      StreamManager.prepare_for_draining(pid)
       sync(pid)
 
       # RPC result arrives after drain — should be ignored, not crash
@@ -1517,7 +1926,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert_receive {:stream_messages, [_]}, 500
 
       # Enter drain mode
-      StreamManager.stop_receiving(pid)
+      StreamManager.prepare_for_draining(pid)
       sync(pid)
 
       state = :sys.get_state(pid)
@@ -1534,6 +1943,680 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert map_size(state.outstanding) == 0
       # Drain should have completed: timer cancelled
       assert state.drain_timer == nil
+    end
+  end
+
+  # ============================================================
+  # P0-04: pressure_snapshot telemetry
+  # ============================================================
+
+  describe "pressure_snapshot telemetry" do
+    test "emits :pressure_snapshot during :extend_leases with correct counts" do
+      pid = start_manager()
+      test_pid = self()
+      telemetry_name = "test-pressure-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :pressure_snapshot],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :pressure_snapshot}
+      )
+
+      # Dispatch 2 messages (in-flight, outstanding)
+      StreamManager.notify_demand(pid, 10)
+
+      send(
+        pid,
+        {:stream_messages, [received_message("ps-1", "d1"), received_message("ps-2", "d2")]}
+      )
+
+      assert_receive {:stream_messages, _}, 500
+
+      # Buffer one message by zeroing pending_demand so it stays buffered.
+      # Note: the buffered message IS also in outstanding — all received messages
+      # are added to outstanding at receipt time regardless of buffer state.
+      :sys.replace_state(pid, fn s -> %{s | pending_demand: 0} end)
+      send(pid, {:stream_messages, [received_message("ps-buf", "buf")]})
+      # Wait for it to land in the buffer
+      assert buffer_length(pid) == 1
+
+      # Set pending_demand to a known value for assertion
+      :sys.replace_state(pid, fn s -> %{s | pending_demand: 5} end)
+
+      send(pid, :extend_leases)
+      sync(pid)
+
+      assert_receive {:pressure_snapshot, measurements, metadata}, 500
+
+      # 3 outstanding: 2 dispatched + 1 buffered (all in outstanding map)
+      assert measurements.outstanding_count == 3
+      assert measurements.buffered_count == 1
+      assert measurements.pending_demand == 5
+
+      assert metadata.subscription == "projects/test/subscriptions/test-sub"
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test ":pressure_snapshot measurements shape is correct" do
+      pid = start_manager()
+      test_pid = self()
+      telemetry_name = "test-pressure-shape-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :pressure_snapshot],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :pressure_snapshot}
+      )
+
+      send(pid, :extend_leases)
+      sync(pid)
+
+      assert_receive {:pressure_snapshot, measurements, _metadata}, 500
+
+      assert is_integer(measurements.outstanding_count) and measurements.outstanding_count >= 0
+      assert is_integer(measurements.buffered_count) and measurements.buffered_count >= 0
+      assert is_integer(measurements.pending_demand) and measurements.pending_demand >= 0
+
+      :telemetry.detach(telemetry_name)
+    end
+  end
+
+  # ============================================================
+  # P0-05: drain telemetry (async span: :start / :stop / :exception)
+  # ============================================================
+
+  describe "drain :start telemetry" do
+    test "emits drain :start with system_time and monotonic_time, correct initial counts" do
+      pid = start_manager()
+      test_pid = self()
+      telemetry_name = "test-drain-start-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :start],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_start}
+      )
+
+      # Dispatch 2 messages to outstanding (in-flight)
+      StreamManager.notify_demand(pid, 10)
+
+      send(
+        pid,
+        {:stream_messages, [received_message("ds-1", "d1"), received_message("ds-2", "d2")]}
+      )
+
+      assert_receive {:stream_messages, _}, 500
+
+      # Buffer 1 message by zeroing pending_demand
+      :sys.replace_state(pid, fn s -> %{s | pending_demand: 0} end)
+      send(pid, {:stream_messages, [received_message("ds-buf", "buf")]})
+      assert buffer_length(pid) == 1
+
+      # Inject 1 pending receipt modack
+      ref = make_ref()
+      inject_pending_receipt_modack(pid, ref, ["ds-eo"], %{"ds-eo" => "eo"})
+
+      StreamManager.prepare_for_draining(pid)
+
+      assert_receive {:drain_start, measurements, metadata}, 500
+
+      # Span start measurements: system_time and monotonic_time
+      assert is_integer(measurements.system_time)
+      assert is_integer(measurements.monotonic_time)
+
+      # Counts captured at the moment of drain initiation (before any cleanup)
+      # outstanding_count = 2 in-flight + 1 buffered = 3
+      assert measurements.outstanding_count == 3
+      assert measurements.buffered_count == 1
+      assert measurements.pending_receipt_modack_count == 1
+
+      assert metadata.subscription == "projects/test/subscriptions/test-sub"
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "emits drain :start with zeros when nothing is outstanding" do
+      pid = start_manager()
+      test_pid = self()
+      telemetry_name = "test-drain-start-empty-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :start],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_start}
+      )
+
+      StreamManager.prepare_for_draining(pid)
+
+      assert_receive {:drain_start, measurements, _metadata}, 500
+
+      assert measurements.outstanding_count == 0
+      assert measurements.buffered_count == 0
+      assert measurements.pending_receipt_modack_count == 0
+
+      :telemetry.detach(telemetry_name)
+    end
+  end
+
+  describe "drain :stop telemetry" do
+    test "emits drain :stop with positive duration when drain completes cleanly" do
+      pid = start_manager(drain_timeout_ms: 5_000)
+      test_pid = self()
+      telemetry_name = "test-drain-stop-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :stop],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_stop}
+      )
+
+      # One in-flight message
+      StreamManager.notify_demand(pid, 10)
+      send(pid, {:stream_messages, [received_message("stop-ack-1", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      # Ack the message — drain completes
+      StreamManager.acknowledge(pid, ["stop-ack-1"])
+
+      assert_receive {:drain_stop, measurements, metadata}, 500
+
+      assert is_integer(measurements.duration)
+      assert measurements.duration >= 0
+      assert is_integer(measurements.monotonic_time)
+      assert metadata.subscription == "projects/test/subscriptions/test-sub"
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "drain :stop is emitted when outstanding is already empty at prepare_for_draining" do
+      pid = start_manager()
+      test_pid = self()
+      telemetry_name = "test-drain-stop-immediate-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :stop],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_stop}
+      )
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      assert_receive {:drain_stop, measurements, _metadata}, 500
+
+      assert is_integer(measurements.duration)
+      assert measurements.duration >= 0
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "clean drain does NOT emit :exception" do
+      pid = start_manager(drain_timeout_ms: 5_000)
+      test_pid = self()
+      telemetry_name = "test-drain-no-exception-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :exception],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_exception}
+      )
+
+      StreamManager.notify_demand(pid, 10)
+      send(pid, {:stream_messages, [received_message("clean-drain", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+      StreamManager.acknowledge(pid, ["clean-drain"])
+      sync(pid)
+
+      refute_received {:drain_exception, _, _}
+
+      :telemetry.detach(telemetry_name)
+    end
+  end
+
+  describe "drain :exception telemetry" do
+    test "emits drain :exception with kind: :timeout when drain_timeout fires" do
+      pid = start_manager(drain_timeout_ms: 50)
+      test_pid = self()
+      telemetry_name = "test-drain-exception-timeout-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :exception],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_exception}
+      )
+
+      # One in-flight message (never acked so timeout fires)
+      StreamManager.notify_demand(pid, 10)
+      send(pid, {:stream_messages, [received_message("timeout-ack-1", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      # Wait for the 50ms drain_timeout
+      assert_receive {:drain_exception, measurements, metadata}, 500
+
+      assert metadata.kind == :timeout
+      assert metadata.reason == :drain_timeout
+      assert measurements.remaining_count == 1
+      assert is_integer(measurements.duration)
+      assert measurements.duration >= 0
+      assert is_integer(measurements.monotonic_time)
+      assert metadata.subscription == "projects/test/subscriptions/test-sub"
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "drain_timeout does NOT emit :stop" do
+      pid = start_manager(drain_timeout_ms: 50)
+      test_pid = self()
+      telemetry_name = "test-drain-timeout-no-stop-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :stop],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_stop}
+      )
+
+      StreamManager.notify_demand(pid, 10)
+      send(pid, {:stream_messages, [received_message("timeout-no-stop", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      # Wait long enough for timeout to fire
+      Process.sleep(150)
+      sync(pid)
+
+      refute_received {:drain_stop, _, _}
+
+      :telemetry.detach(telemetry_name)
+    end
+
+    test "emits drain :exception with kind: :terminate when process is terminated mid-drain" do
+      pid = start_manager(drain_timeout_ms: 5_000)
+      test_pid = self()
+      telemetry_name = "test-drain-exception-terminate-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        telemetry_name,
+        [:broadway_cloud_pub_sub, :streaming, :stream, :drain, :exception],
+        &TelemetryHelper.handle_event_forward_test/4,
+        %{pid: test_pid, msg: :drain_exception}
+      )
+
+      # One in-flight message (never acked)
+      StreamManager.notify_demand(pid, 10)
+      send(pid, {:stream_messages, [received_message("term-ack-1", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      # Monitor then stop the GenServer normally
+      ref = Process.monitor(pid)
+      GenServer.stop(pid, :normal)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 500
+
+      assert_receive {:drain_exception, measurements, metadata}, 500
+
+      assert metadata.kind == :terminate
+      assert metadata.reason == :normal
+      assert measurements.remaining_count == 1
+      assert is_integer(measurements.duration)
+      assert metadata.subscription == "projects/test/subscriptions/test-sub"
+
+      :telemetry.detach(telemetry_name)
+    end
+  end
+
+  # ============================================================
+  # P0-05: drain failure scenarios
+  # ============================================================
+
+  describe "drain failure scenarios" do
+    test "stream_error (retryable) during drain does not prevent drain completion via ack" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      # Dispatch one message to make it in-flight
+      send(pid, {:stream_messages, [received_message("drain-err-1", "data")]})
+      assert_receive {:stream_messages, [_]}, 500
+
+      assert map_size(:sys.get_state(pid).outstanding) == 1
+
+      # Start drain
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      # Cancel any pre-existing reconnect (from initial failed connection attempt)
+      # so we can cleanly assert there's no reconnect scheduled after the stream_error.
+      :sys.replace_state(pid, fn s ->
+        if s.reconnect_ref, do: Process.cancel_timer(s.reconnect_ref)
+        %{s | reconnect_ref: nil}
+      end)
+
+      # Stream disconnects while we're draining (common race)
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+      sync(pid)
+
+      # Process is still alive and draining
+      assert Process.alive?(pid)
+      state = :sys.get_state(pid)
+      assert state.draining == true
+      # No reconnect scheduled during drain
+      assert state.reconnect_ref == nil
+
+      # Ack completes — drain should finish
+      StreamManager.acknowledge(pid, ["drain-err-1"])
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 0
+      assert state.drain_timer == nil
+    end
+
+    test "stream_closed during drain does not prevent drain completion via ack" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("drain-close-1", "data")]})
+      assert_receive {:stream_messages, [_]}, 500
+
+      {:ok, 0} = StreamManager.prepare_for_draining(pid)
+
+      # Cancel any pre-existing reconnect from initial failed connection attempt
+      :sys.replace_state(pid, fn s ->
+        if s.reconnect_ref, do: Process.cancel_timer(s.reconnect_ref)
+        %{s | reconnect_ref: nil}
+      end)
+
+      # Server closes stream (normal — no reconnect during drain)
+      send(pid, {:stream_closed})
+      sync(pid)
+
+      assert Process.alive?(pid)
+      state = :sys.get_state(pid)
+      assert state.draining == true
+      assert state.reconnect_ref == nil
+
+      # Ack the in-flight message — drain completes
+      StreamManager.acknowledge(pid, ["drain-close-1"])
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 0
+      assert state.drain_timer == nil
+    end
+
+    test "drain with mixed buffered + in-flight: only in-flight blocks drain completion" do
+      pid = start_manager()
+
+      # Dispatch 2 messages (in-flight)
+      StreamManager.notify_demand(pid, 10)
+
+      send(
+        pid,
+        {:stream_messages,
+         [received_message("mix-if-1", "d1"), received_message("mix-if-2", "d2")]}
+      )
+
+      assert_receive {:stream_messages, _}, 500
+
+      # Buffer 2 messages by zeroing pending_demand
+      :sys.replace_state(pid, fn s -> %{s | pending_demand: 0} end)
+
+      send(
+        pid,
+        {:stream_messages,
+         [received_message("mix-buf-1", "b1"), received_message("mix-buf-2", "b2")]}
+      )
+
+      assert buffer_length(pid) == 2
+
+      state = :sys.get_state(pid)
+      # 4 outstanding total: 2 in-flight + 2 buffered
+      assert map_size(state.outstanding) == 4
+
+      # Drain: buffered 2 are nacked and removed; 2 in-flight remain
+      {:ok, 2} = StreamManager.prepare_for_draining(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 2
+      assert Map.has_key?(state.outstanding, "mix-if-1")
+      assert Map.has_key?(state.outstanding, "mix-if-2")
+      assert state.drain_timer != nil
+
+      # Ack one in-flight — drain not complete yet
+      StreamManager.acknowledge(pid, ["mix-if-1"])
+      sync(pid)
+      assert state.drain_timer != nil
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 1
+
+      # Ack the last in-flight — drain completes
+      StreamManager.acknowledge(pid, ["mix-if-2"])
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.outstanding) == 0
+      assert state.drain_timer == nil
+    end
+
+    test "drain with pending receipt modacks: clears them on prepare_for_draining" do
+      pid = start_manager()
+
+      # Inject 2 pending receipt modacks
+      ref1 = make_ref()
+      ref2 = make_ref()
+      inject_pending_receipt_modack(pid, ref1, ["eo-drain-1"], %{"eo-drain-1" => "d1"})
+      inject_pending_receipt_modack(pid, ref2, ["eo-drain-2"], %{"eo-drain-2" => "d2"})
+
+      assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 2
+
+      # Drain clears pending receipt modacks immediately
+      StreamManager.prepare_for_draining(pid)
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 0
+      # Drain should complete since outstanding is also empty
+      assert map_size(state.outstanding) == 0
+      assert state.drain_timer == nil
+    end
+  end
+
+  # ============================================================
+  # P0-06: EO and non-EO behavior invariants
+  # ============================================================
+
+  describe "non-EO behavior invariants" do
+    test "messages are immediately added to outstanding on receipt" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      send(
+        pid,
+        {:stream_messages, [received_message("neo-1", "d1"), received_message("neo-2", "d2")]}
+      )
+
+      assert_receive {:stream_messages, msgs}, 500
+
+      assert length(msgs) == 2
+
+      state = :sys.get_state(pid)
+      # Both ack_ids must be in outstanding immediately
+      assert Map.has_key?(state.outstanding, "neo-1")
+      assert Map.has_key?(state.outstanding, "neo-2")
+      # No pending receipt modacks in non-EO mode
+      assert map_size(state.pending_receipt_modacks) == 0
+    end
+
+    test "ack removes from outstanding" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("neo-ack", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      assert Map.has_key?(:sys.get_state(pid).outstanding, "neo-ack")
+
+      StreamManager.acknowledge(pid, ["neo-ack"])
+      sync(pid)
+
+      refute Map.has_key?(:sys.get_state(pid).outstanding, "neo-ack")
+    end
+
+    test "nack (deadline=0) removes from outstanding" do
+      pid = start_manager()
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("neo-nack", "data")]})
+      assert_receive {:stream_messages, _}, 500
+
+      assert Map.has_key?(:sys.get_state(pid).outstanding, "neo-nack")
+
+      StreamManager.modify_deadline(pid, ["neo-nack"], 0)
+      sync(pid)
+
+      refute Map.has_key?(:sys.get_state(pid).outstanding, "neo-nack")
+    end
+
+    test "reconnect does not clear buffered messages' outstanding entries" do
+      # Buffered messages ARE in outstanding; after reconnect the buffer is
+      # cleared but the ack_ids are also removed from outstanding.
+      pid = start_manager(backoff_min: 60_000)
+      StreamManager.notify_demand(pid, 0)
+
+      send(pid, {:stream_messages, [received_message("buf-reconnect", "data")]})
+      assert buffer_length(pid) == 1
+
+      state = :sys.get_state(pid)
+      assert Map.has_key?(state.outstanding, "buf-reconnect")
+
+      # Simulate retryable reconnect — buffer is dropped and outstanding cleared for buffered
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+      sync(pid)
+
+      # After reset_connection, the buffered ack_id is removed from outstanding
+      state = :sys.get_state(pid)
+      refute Map.has_key?(state.outstanding, "buf-reconnect")
+      assert buffer_length(pid) == 0
+    end
+  end
+
+  describe "EO behavior invariants" do
+    test "in EO mode, messages are NOT in outstanding before receipt modack succeeds" do
+      {pid, _rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("eo-inv-1", "data")]})
+      sync(pid)
+
+      # Pending — not yet in outstanding
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 1
+      refute Map.has_key?(state.outstanding, "eo-inv-1")
+    end
+
+    test "in EO mode, messages are added to outstanding only after receipt modack {:ok, []}" do
+      {pid, _rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      send(pid, {:stream_messages, [received_message("eo-inv-2", "data")]})
+      sync(pid)
+
+      # Retrieve the pending ref
+      state = :sys.get_state(pid)
+      [ref] = Map.keys(state.pending_receipt_modacks)
+
+      # Confirm receipt modack success
+      send(pid, {:receipt_modack_result, ref, {:ok, []}})
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 0
+      assert Map.has_key?(state.outstanding, "eo-inv-2")
+    end
+
+    test "in EO mode, total receipt modack failure drops messages (no dispatch, no outstanding)" do
+      {pid, rpc} = start_manager_with_spy_rpc()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      :ok = GenServer.call(rpc, {:set_response_sync, {:error, :unavailable}})
+
+      send(pid, {:stream_messages, [received_message("eo-inv-fail", "data")]})
+      Process.sleep(200)
+      sync(pid)
+
+      refute_received {:stream_messages, _}
+
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 0
+      refute Map.has_key?(state.outstanding, "eo-inv-fail")
+    end
+
+    test "in EO mode, partial receipt modack failure: succeeded messages in outstanding, failed are not" do
+      pid = start_manager()
+      enable_exactly_once(pid)
+      StreamManager.notify_demand(pid, 10)
+
+      ref = make_ref()
+
+      inject_pending_receipt_modack(pid, ref, ["eo-ok", "eo-fail"], %{
+        "eo-ok" => "good",
+        "eo-fail" => "bad"
+      })
+
+      send(pid, {:receipt_modack_result, ref, {:ok, ["eo-fail"]}})
+
+      assert_receive {:stream_messages, msgs}, 500
+      assert length(msgs) == 1
+      assert hd(msgs).data == "good"
+
+      state = :sys.get_state(pid)
+      assert Map.has_key?(state.outstanding, "eo-ok")
+      refute Map.has_key?(state.outstanding, "eo-fail")
+    end
+
+    test "switching from non-EO to EO: new messages go through gate, not immediate dispatch" do
+      # Start with a spy RPC so we can control modack responses.
+      # We need to use start_manager_with_spy_rpc throughout so the spy
+      # is in place before we enable EO.
+      {pid, _rpc} = start_manager_with_spy_rpc()
+      StreamManager.notify_demand(pid, 10)
+
+      # Non-EO (default): message dispatched immediately
+      send(pid, {:stream_messages, [received_message("before-eo", "data")]})
+
+      # The spy RPC responds :ok, so the modack Task fires {:ok, []} and
+      # the message is dispatched straight through (standard path)
+      assert_receive {:stream_messages, _}, 500
+      assert map_size(:sys.get_state(pid).pending_receipt_modacks) == 0
+
+      # Enable EO mode
+      enable_exactly_once(pid)
+
+      # EO: new message must be held in pending_receipt_modacks, not dispatched
+      send(pid, {:stream_messages, [received_message("after-eo", "data")]})
+      sync(pid)
+
+      state = :sys.get_state(pid)
+      assert map_size(state.pending_receipt_modacks) == 1
     end
   end
 end

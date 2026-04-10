@@ -7,7 +7,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
 
   use GenServer
 
-  alias BroadwayCloudPubSub.Streaming.{Telemetry, UnaryRpcClient}
+  alias BroadwayCloudPubSub.Streaming.{Options, Telemetry, UnaryRpcClient}
 
   @max_modack_attempts 3
 
@@ -53,16 +53,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
   @doc false
   @spec child_opts(keyword()) :: keyword()
   def child_opts(opts) do
-    picked = Keyword.take(opts, @all_keys)
-
-    Enum.each(@required_keys, fn key ->
-      unless Keyword.has_key?(picked, key) do
-        raise ArgumentError,
-              "missing required option #{inspect(key)} for #{inspect(__MODULE__)}"
-      end
-    end)
-
-    picked
+    Options.validate_child_opts(opts, @all_keys, @required_keys)
   end
 
   @doc """

@@ -511,13 +511,12 @@ defmodule BroadwayCloudPubSub.Streaming.ProducerPrepareForStartTest do
       assert grpc_client_config.broadway_name == TestPipeline
     end
 
-    test "returns two child specs: UnaryAckSupervisor first, StreamManager second" do
+    test "returns one child spec: UnaryAckSupervisor (StreamManagers are started per-producer in init)" do
       {specs, _opts} = Producer.prepare_for_start(Producer, broadway_opts())
 
-      assert length(specs) == 2
-      [sup_spec, manager_spec] = specs
+      assert length(specs) == 1
+      [sup_spec] = specs
       assert sup_spec.type == :supervisor
-      assert manager_spec[:type] == nil or manager_spec[:restart] == :permanent
     end
   end
 end

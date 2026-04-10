@@ -1154,7 +1154,7 @@ defmodule BroadwayCloudPubSub.Streaming.StressTest do
 
       # Kill the Gun connection process and simulate gun_down so StreamManager
       # detects the disconnect and reconnects.
-      stream_manager = Module.concat(name, BroadwayCloudPubSub.Streaming.StreamManager)
+      stream_manager = Module.concat(name, "StreamManager_0")
       sm_state = :sys.get_state(stream_manager)
 
       case sm_state do
@@ -1239,7 +1239,7 @@ defmodule BroadwayCloudPubSub.Streaming.StressTest do
 
       # Mirror the Mint test exactly: get conn_pid, kill the process, then send the
       # adapter-level disconnect signal so StreamManager detects it via the new handler.
-      stream_manager = Module.concat(name, BroadwayCloudPubSub.Streaming.StreamManager)
+      stream_manager = Module.concat(name, "StreamManager_0")
       sm_state = :sys.get_state(stream_manager)
 
       case sm_state do
@@ -1320,7 +1320,7 @@ defmodule BroadwayCloudPubSub.Streaming.StressTest do
       end
 
       # For Mint, kill the conn_pid and simulate the connection_down message
-      stream_manager = Module.concat(name, BroadwayCloudPubSub.Streaming.StreamManager)
+      stream_manager = Module.concat(name, "StreamManager_0")
       sm_state = :sys.get_state(stream_manager)
 
       case sm_state do

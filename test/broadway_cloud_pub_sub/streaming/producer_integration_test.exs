@@ -191,4 +191,52 @@ defmodule BroadwayCloudPubSub.Streaming.ProducerIntegrationTest do
       assert messages == []
     end
   end
+
+  describe "graceful shutdown" do
+    test "Broadway.stop completes promptly when messages are buffered", %{pipeline: pid} do
+      # Broadway.stop triggers the drain sequence. The pipeline should shut down
+      # promptly (within the shutdown timeout) rather than processing all buffered
+      # messages. We verify that stop returns within a reasonable time.
+      ref = Process.monitor(pid)
+
+      try do
+        Broadway.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+
+      # Pipeline should shut down within 10 seconds (well under the 30s shutdown timeout).
+      # Before the fix, this would take minutes as all buffered messages were processed.
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      after
+        10_000 -> flunk("Broadway.stop did not complete within 10 seconds")
+      end
+    end
+
+    test "Broadway.stop completes promptly with buffered messages", %{topic: topic, pipeline: pid} do
+      # Publish enough messages to fill the buffer, then stop immediately.
+      # The pipeline should shut down quickly, nacking the buffered messages.
+      payloads = Enum.map(1..30, &"shutdown-msg-#{&1}")
+      {:ok, _msg_ids} = PubSubEmulator.publish(topic, payloads)
+
+      # Give the pipeline a moment to receive some messages
+      Process.sleep(500)
+
+      ref = Process.monitor(pid)
+
+      try do
+        Broadway.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+
+      # Should complete well under the 30s shutdown timeout.
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      after
+        10_000 -> flunk("Broadway.stop with buffered messages did not complete within 10 seconds")
+      end
+    end
+  end
 end

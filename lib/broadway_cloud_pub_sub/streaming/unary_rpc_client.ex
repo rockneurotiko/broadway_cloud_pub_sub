@@ -31,8 +31,8 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
 
   use GenServer
 
-  alias BroadwayCloudPubSub.{Backoff}
-  alias BroadwayCloudPubSub.Streaming.{AckResult, ErrorClassifier, Telemetry}
+  alias BroadwayCloudPubSub.Backoff
+  alias BroadwayCloudPubSub.Streaming.{AckResult, ErrorClassifier, Options, Telemetry}
   alias Google.Pubsub.V1.{AcknowledgeRequest, ModifyAckDeadlineRequest}
 
   require Logger
@@ -76,16 +76,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   @doc false
   @spec child_opts(keyword()) :: keyword()
   def child_opts(opts) do
-    picked = Keyword.take(opts, @all_keys)
-
-    Enum.each(@required_keys, fn key ->
-      unless Keyword.has_key?(picked, key) do
-        raise ArgumentError,
-              "missing required option #{inspect(key)} for #{inspect(__MODULE__)}"
-      end
-    end)
-
-    picked
+    Options.validate_child_opts(opts, @all_keys, @required_keys)
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -109,22 +100,9 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   """
   @spec acknowledge(GenServer.server(), [String.t()]) :: {:ok, [String.t()]} | {:error, term()}
   def acknowledge(pid, ack_ids) when is_list(ack_ids) do
-    ack_ids
-    |> Enum.chunk_every(@max_ack_ids_per_request)
-    |> Enum.reduce({:ok, []}, fn
-      chunk, {:ok, failed_so_far} ->
-        case GenServer.call(pid, {:acknowledge, chunk}, 30_000) do
-          :ok -> {:ok, failed_so_far}
-          {:error, _reason} -> {:ok, failed_so_far ++ chunk}
-        end
-
-      _chunk, {:error, _} = err ->
-        # Hard process error — don't attempt remaining chunks
-        err
+    chunked_rpc(pid, ack_ids, fn chunk ->
+      GenServer.call(pid, {:acknowledge, chunk}, 30_000)
     end)
-  catch
-    :exit, reason ->
-      {:error, {:call_failed, reason}}
   end
 
   @doc """
@@ -135,21 +113,9 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   @spec modify_ack_deadline(GenServer.server(), [String.t()], non_neg_integer()) ::
           {:ok, [String.t()]} | {:error, term()}
   def modify_ack_deadline(pid, ack_ids, deadline_seconds) when is_list(ack_ids) do
-    ack_ids
-    |> Enum.chunk_every(@max_ack_ids_per_request)
-    |> Enum.reduce({:ok, []}, fn
-      chunk, {:ok, failed_so_far} ->
-        case GenServer.call(pid, {:modify_ack_deadline, chunk, deadline_seconds}, 30_000) do
-          :ok -> {:ok, failed_so_far}
-          {:error, _reason} -> {:ok, failed_so_far ++ chunk}
-        end
-
-      _chunk, {:error, _} = err ->
-        err
+    chunked_rpc(pid, ack_ids, fn chunk ->
+      GenServer.call(pid, {:modify_ack_deadline, chunk, deadline_seconds}, 30_000)
     end)
-  catch
-    :exit, reason ->
-      {:error, {:call_failed, reason}}
   end
 
   # --- GenServer callbacks ---
@@ -190,102 +156,24 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
 
   @impl GenServer
   def handle_call({:acknowledge, ack_ids}, _from, state) do
-    state = ensure_channel(state)
+    request = %AcknowledgeRequest{
+      subscription: state.config.subscription,
+      ack_ids: ack_ids
+    }
 
-    case state.channel do
-      nil ->
-        {:reply, {:error, :no_channel}, state}
-
-      channel ->
-        request = %AcknowledgeRequest{
-          subscription: state.config.subscription,
-          ack_ids: ack_ids
-        }
-
-        result = state.grpc_client.acknowledge(channel, request, state.grpc_client_config)
-
-        case result do
-          {:ok, _} ->
-            {:reply, :ok, state}
-
-          {:error, error} ->
-            case ErrorClassifier.classify(error) do
-              :retryable ->
-                # For exactly-once subscriptions, retryable RPC errors may embed
-                # per-ack-ID permanent failures in error details. Permanent ids
-                # are dropped; transient ones are returned to AckBatcher for retry.
-                per_ack_errors = AckResult.parse_error_details(Map.get(error, :details))
-                {transient_ids, permanent_ids} = split_by_ack_result(ack_ids, per_ack_errors)
-
-                if permanent_ids != [] do
-                  emit_telemetry(
-                    :permanent_failure,
-                    %{count: length(permanent_ids)},
-                    state.config
-                  )
-                end
-
-                state = schedule_reconnect(state)
-                {:reply, {:error, {error, transient_ids}}, state}
-
-              :terminal ->
-                Logger.error(
-                  "Unable to acknowledge messages with Cloud Pub/Sub via gRPC - reason: #{inspect(error)}"
-                )
-
-                # Reply first so caller can retain ack_ids, then stop so supervisor restarts fresh.
-                {:stop, {:terminal_error, error}, {:error, error}, state}
-            end
-        end
-    end
+    grpc_client = state.grpc_client
+    do_rpc(state, ack_ids, request, &grpc_client.acknowledge/3, "acknowledge messages")
   end
 
   def handle_call({:modify_ack_deadline, ack_ids, deadline_seconds}, _from, state) do
-    state = ensure_channel(state)
+    request = %ModifyAckDeadlineRequest{
+      subscription: state.config.subscription,
+      ack_ids: ack_ids,
+      ack_deadline_seconds: deadline_seconds
+    }
 
-    case state.channel do
-      nil ->
-        {:reply, {:error, :no_channel}, state}
-
-      channel ->
-        request = %ModifyAckDeadlineRequest{
-          subscription: state.config.subscription,
-          ack_ids: ack_ids,
-          ack_deadline_seconds: deadline_seconds
-        }
-
-        result = state.grpc_client.modify_ack_deadline(channel, request, state.grpc_client_config)
-
-        case result do
-          {:ok, _} ->
-            {:reply, :ok, state}
-
-          {:error, error} ->
-            case ErrorClassifier.classify(error) do
-              :retryable ->
-                per_ack_errors = AckResult.parse_error_details(Map.get(error, :details))
-                {transient_ids, permanent_ids} = split_by_ack_result(ack_ids, per_ack_errors)
-
-                if permanent_ids != [] do
-                  emit_telemetry(
-                    :permanent_failure,
-                    %{count: length(permanent_ids)},
-                    state.config
-                  )
-                end
-
-                state = schedule_reconnect(state)
-                {:reply, {:error, {error, transient_ids}}, state}
-
-              :terminal ->
-                Logger.error(
-                  "Unable to modify ack deadline for messages with Cloud Pub/Sub via gRPC - reason: #{inspect(error)}"
-                )
-
-                {:stop, {:terminal_error, error}, {:error, error}, state}
-            end
-        end
-    end
+    grpc_client = state.grpc_client
+    do_rpc(state, ack_ids, request, &grpc_client.modify_ack_deadline/3, "modify ack deadline for messages")
   end
 
   @impl GenServer
@@ -332,6 +220,74 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   def terminate(_reason, _state), do: :ok
 
   # --- Private ---
+
+  # Chunks ack_ids into batches of @max_ack_ids_per_request and calls `call_fn`
+  # for each chunk. Accumulates failed chunks. Stops on hard process errors.
+  defp chunked_rpc(_pid, ack_ids, call_fn) do
+    ack_ids
+    |> Enum.chunk_every(@max_ack_ids_per_request)
+    |> Enum.reduce({:ok, []}, fn
+      chunk, {:ok, failed_so_far} ->
+        case call_fn.(chunk) do
+          :ok -> {:ok, failed_so_far}
+          {:error, _reason} -> {:ok, failed_so_far ++ chunk}
+        end
+
+      _chunk, {:error, _} = err ->
+        # Hard process error — don't attempt remaining chunks
+        err
+    end)
+  catch
+    :exit, reason ->
+      {:error, {:call_failed, reason}}
+  end
+
+  # Shared RPC execution: ensure channel, call the given rpc_fn, classify errors.
+  # `rpc_fn` is a 3-arity function (channel, request, grpc_client_config).
+  # `operation` is a human-readable string for Logger.error messages.
+  defp do_rpc(state, ack_ids, request, rpc_fn, operation) do
+    state = ensure_channel(state)
+
+    case state.channel do
+      nil ->
+        {:reply, {:error, :no_channel}, state}
+
+      channel ->
+        case rpc_fn.(channel, request, state.grpc_client_config) do
+          {:ok, _} ->
+            {:reply, :ok, state}
+
+          {:error, error} ->
+            handle_rpc_error(state, ack_ids, error, operation)
+        end
+    end
+  end
+
+  defp handle_rpc_error(state, ack_ids, error, operation) do
+    case ErrorClassifier.classify(error) do
+      :retryable ->
+        # For exactly-once subscriptions, retryable RPC errors may embed
+        # per-ack-ID permanent failures in error details. Permanent ids
+        # are dropped; transient ones are returned to AckBatcher for retry.
+        per_ack_errors = AckResult.parse_error_details(Map.get(error, :details))
+        {transient_ids, permanent_ids} = split_by_ack_result(ack_ids, per_ack_errors)
+
+        if permanent_ids != [] do
+          emit_telemetry(:permanent_failure, %{count: length(permanent_ids)}, state.config)
+        end
+
+        state = schedule_reconnect(state)
+        {:reply, {:error, {error, transient_ids}}, state}
+
+      :terminal ->
+        Logger.error(
+          "Unable to #{operation} with Cloud Pub/Sub via gRPC - reason: #{inspect(error)}"
+        )
+
+        # Reply first so caller can retain ack_ids, then stop so supervisor restarts fresh.
+        {:stop, {:terminal_error, error}, {:error, error}, state}
+    end
+  end
 
   defp ensure_channel(%{channel: nil} = state) do
     case state.grpc_client.connect(state.grpc_client_config) do

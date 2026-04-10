@@ -10,17 +10,23 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   efficient than the HTTP pull approach (`BroadwayCloudPubSub.Producer`) for
   workloads that require low latency or high throughput.
 
-  The architecture has three layers:
+  Each producer process (N = `producer: [concurrency: N]`) starts and links
+  its own **StreamManager** (GenServer), giving N independent gRPC streams
+  that mirror the Go client’s N `messageIterator`s sharing a single `clientID`.
 
-    1. **StreamManager** (GenServer) — owns the gRPC stream and connection
-       lifecycle, manages lease extensions, and dispatches messages to the
-       Producer when downstream demand is available.
-    2. **Producer** (GenStage) — receives messages from StreamManager and
-       forwards them to Broadway processors. Tracks demand from downstream
-       stages.
-    3. **UnaryAckSupervisor** — supervises AckBatcher and UnaryRpcClient, which
-       batch and send acknowledgement and deadline-modification requests via
-       separate unary RPCs (not on the streaming connection).
+  Key components:
+
+    * **StreamManager** — GenServer that owns the gRPC bidirectional stream,
+      manages connection lifecycle (connect/reconnect/backoff), extends message
+      leases, and dispatches messages to the linked Producer when demand is
+      available. Started via `start_link` from `Producer.init/1`.
+
+    * **Producer** — GenStage process that bridges StreamManager to Broadway.
+      Tracks downstream demand and forwards messages to processors.
+
+    * **UnaryAckSupervisor** — shared across all producers. Supervises
+      AckBatcher and UnaryRpcClient, which batch and send ack/nack/modifyAckDeadline
+      requests via separate unary RPCs (not on the streaming connection).
 
   ## Usage
 
@@ -193,24 +199,48 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
       Measurements: `%{count: pos_integer()}`
 
-    * `:drain_timeout` — graceful shutdown drain timed out before all in-flight
-      messages were processed.
+    * `:drain` — async span tracking the full graceful drain lifecycle, from
+      `prepare_for_draining/1` through completion, timeout, or unexpected
+      termination. Uses the same measurements convention as `:telemetry.span/3`.
 
-      Measurements: `%{}`
+      Events:
 
-    * `:drain_complete` — all in-flight messages were processed before the drain
-      timeout; stream closed cleanly.
+      * `[:broadway_cloud_pub_sub, :streaming, :stream, :drain, :start]` — drain
+        initiated. Emitted before the reader is closed or any messages are nacked.
 
-      Measurements: `%{}`
+        Measurements: `%{system_time: integer(), monotonic_time: integer(),
+        buffered_count: non_neg_integer(), outstanding_count: non_neg_integer(),
+        pending_receipt_modack_count: non_neg_integer()}`
 
-    * `:reconnect` — reconnect scheduled after a retryable stream error.
+      * `[:broadway_cloud_pub_sub, :streaming, :stream, :drain, :stop]` — all
+        in-flight messages were processed and stream closed cleanly.
 
-      Measurements: `%{delay: non_neg_integer()}`
+        Measurements: `%{duration: non_neg_integer(), monotonic_time: integer()}`
 
-    * `:receipt_modack_stale` — pending exactly-once receipt modacks swept out
-      as stale and nacked for fast redelivery.
+      * `[:broadway_cloud_pub_sub, :streaming, :stream, :drain, :exception]` —
+        drain ended abnormally.
 
-      Measurements: `%{count: pos_integer()}`
+        Measurements: `%{duration: non_neg_integer(), monotonic_time: integer()}`
+        (plus `remaining_count: non_neg_integer()` for `:timeout` and `:terminate` kinds)
+
+        Metadata includes `kind` and `reason` identifying the cause:
+
+        * `kind: :timeout, reason: :drain_timeout` — `drain_timeout_ms` elapsed
+          before all messages were acked. Remaining messages are nacked immediately.
+        * `kind: :terminate, reason: term()` — the GenServer was terminated while
+          a drain was in progress.
+        * `kind: :error, reason: binary()` — an exception was raised inside
+          `prepare_for_draining/1` itself.
+
+    * `:pressure_snapshot` — a point-in-time snapshot of pipeline backpressure,
+      emitted on every lease extension cycle. Useful for diagnosing memory
+      or throughput bottlenecks without enabling tracing.
+
+      Measurements: `%{outstanding_count: non_neg_integer(), buffered_count: non_neg_integer(), pending_demand: non_neg_integer()}`
+
+      * `outstanding_count` — messages received but not yet acked or nacked.
+      * `buffered_count` — messages waiting in the internal buffer for producer demand.
+      * `pending_demand` — units of GenStage demand currently unfulfilled.
 
   ### AckBatcher events — `[:broadway_cloud_pub_sub, :streaming, :ack_batcher, ...]`
 
@@ -341,25 +371,16 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
       type: :supervisor
     }
 
-    # StreamManager options
-    stream_manager_name = Module.concat(broadway_name, StreamManager)
-    manager_opts = Keyword.put(opts, :name, stream_manager_name)
-
-    manager_spec = %{
-      id: stream_manager_name,
-      start: {StreamManager, :start_link, [manager_opts]},
-      restart: :permanent
-    }
-
     # Broadway options
     options =
       broadway_opts
       |> put_in([:producer, :module], {producer_module, opts})
       |> maybe_inject_partition_by(opts)
 
-    # UnaryAckSupervisor is listed first so it starts before StreamManager,
-    # ensuring AckBatcher is alive when the first acks are dispatched.
-    {[unary_sup_spec, manager_spec], options}
+    # Only the UnaryAckSupervisor is a shared child spec. Each producer starts
+    # its own StreamManager directly via start_link in init/1 — the natural
+    # link means crashes propagate without needing a supervisor.
+    {[unary_sup_spec], options}
   end
 
   @impl GenStage
@@ -367,12 +388,21 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     Process.flag(:trap_exit, true)
 
     config = Map.new(opts)
-    ack_ref = config.broadway[:name]
-    manager_name = Module.concat(ack_ref, StreamManager)
-    manager_pid = Process.whereis(manager_name)
+    broadway_name = config.broadway[:name]
+    index = config.broadway[:index]
 
-    # Tell the StreamManager our pid so it can forward messages to us
-    :ok = StreamManager.set_producer(manager_pid, self())
+    # Each producer gets a unique ack_ref so persistent_term entries don't collide.
+    ack_ref = {broadway_name, index}
+    manager_name = Module.concat(broadway_name, "StreamManager_#{index}")
+
+    # Start our own StreamManager directly. start_link creates a natural
+    # bidirectional link — if the manager crashes (terminal gRPC error), the
+    # producer receives an EXIT signal; if the producer dies, the manager does too.
+    manager_opts =
+      opts
+      |> Keyword.merge(name: manager_name, producer_pid: self(), ack_ref: ack_ref)
+
+    {:ok, manager_pid} = StreamManager.start_link(manager_opts)
 
     # Store the manager's *registered name* (not its PID) in persistent_term so
     # the Acknowledger can route acks even after a StreamManager restart. PIDs
@@ -386,22 +416,32 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
        manager_name: manager_name,
        ack_ref: ack_ref,
        config: config,
-       draining: false,
-       demand: 0
+       draining: false
      }}
   end
 
   @impl GenStage
-  def handle_demand(incoming_demand, %{demand: demand} = state) do
-    new_demand = demand + incoming_demand
-    StreamManager.notify_demand(state.manager_pid, new_demand)
-    {:noreply, [], %{state | demand: new_demand}}
+  def handle_demand(_incoming_demand, %{draining: true} = state) do
+    {:noreply, [], state}
+  end
+
+  def handle_demand(incoming_demand, state) do
+    StreamManager.notify_demand(state.manager_pid, incoming_demand)
+    {:noreply, [], state}
   end
 
   @impl GenStage
-  def handle_info({:stream_messages, messages}, %{demand: demand} = state) do
-    new_demand = max(demand - length(messages), 0)
-    {:noreply, messages, %{state | demand: new_demand}}
+  def handle_info({:stream_messages, messages}, state) do
+    {:noreply, messages, state}
+  end
+
+  # StreamManager crashed (terminal gRPC error). Propagate the crash to the
+  # producer so Broadway's supervision restarts the pipeline.
+  def handle_info(
+        {:EXIT, manager_pid, reason},
+        %{manager_pid: manager_pid} = state
+      ) do
+    {:stop, reason, state}
   end
 
   @impl GenStage
@@ -409,14 +449,11 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   @impl Broadway.Producer
   def prepare_for_draining(state) do
-    %{manager_pid: manager_pid, config: config} = state
+    %{manager_pid: manager_pid} = state
 
-    # Nack buffered messages (not yet dispatched to processors) per on_shutdown config.
-    buffered = StreamManager.get_buffered(manager_pid)
-    nack_ack_ids(manager_pid, config, buffered)
-
-    # Stop receiving new messages and begin the drain phase.
-    StreamManager.stop_receiving(manager_pid)
+    # Single atomic call: stops the reader, nacks + clears buffered messages,
+    # removes them from outstanding, and sets draining mode on the StreamManager.
+    {:ok, _nacked_count} = StreamManager.prepare_for_draining(manager_pid)
 
     {:noreply, [], %{state | draining: true}}
   end
@@ -443,9 +480,8 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   # --- Private ---
 
-  # Nack a list of ack_ids per the on_shutdown config. Used by both
-  # prepare_for_draining (for buffered messages) and terminate (for
-  # remaining outstanding messages).
+  # Nack a list of ack_ids per the on_shutdown config. Used by terminate/2
+  # to nack remaining outstanding messages on shutdown.
   defp nack_ack_ids(_manager_pid, _config, []), do: :ok
   defp nack_ack_ids(_manager_pid, %{on_shutdown: :noop}, _ack_ids), do: :ok
 
@@ -496,7 +532,8 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   # Broadway's :partition_by option accepts a function that takes a Broadway.Message
   # and returns a partition key. Broadway hashes the key and routes all messages
   # with the same hash to the same processor stage. Messages with an empty or nil
-  # ordering_key are all routed to partition 0 (unordered messages interleave freely).
+  # ordering_key are spread across processors via unique_integer (unordered messages
+  # should not be funneled to a single partition).
   defp maybe_inject_partition_by(broadway_opts, opts) do
     if opts[:enable_message_ordering] do
       processors =
@@ -510,6 +547,10 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     else
       broadway_opts
     end
+  end
+
+  def partition_by(%Broadway.Message{metadata: %{orderingKey: ""}}) do
+    :erlang.unique_integer([:positive])
   end
 
   def partition_by(%Broadway.Message{metadata: %{orderingKey: key}}) when is_binary(key) do

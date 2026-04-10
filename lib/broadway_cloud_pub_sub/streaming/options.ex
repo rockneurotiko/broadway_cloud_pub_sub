@@ -487,4 +487,26 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
   end
 
   def type_telemetry_metadata(term, _opts), do: {:ok, term}
+
+  @doc """
+  Validates and selects child options from a full config keyword list.
+
+  Takes the given `all_keys`, validates that all `required_keys` are present,
+  and returns only the selected keys. Used by `AckBatcher.child_opts/1` and
+  `UnaryRpcClient.child_opts/1` to extract their required options from the
+  shared pipeline config.
+  """
+  @spec validate_child_opts(keyword(), [atom()], [atom()]) :: keyword()
+  def validate_child_opts(opts, all_keys, required_keys) do
+    picked = Keyword.take(opts, all_keys)
+
+    Enum.each(required_keys, fn key ->
+      unless Keyword.has_key?(picked, key) do
+        raise ArgumentError,
+              "missing required option #{inspect(key)} for child opts"
+      end
+    end)
+
+    picked
+  end
 end

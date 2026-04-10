@@ -16,6 +16,11 @@ defmodule BroadwayCloudPubSub.Streaming.Telemetry do
   #
   #   Telemetry.execute(:stream, :connect, %{}, %{name: name, subscription: sub})
   #   Telemetry.span(:grpc_client, :ack, %{name: name, subscription: sub}, fn -> ... end)
+  #
+  #   # For async spans whose start and stop/exception are emitted separately:
+  #   mono = Telemetry.emit_span_start(:stream, :drain, %{...}, config)
+  #   Telemetry.emit_span_stop(:stream, :drain, mono, %{...}, config)
+  #   Telemetry.emit_span_exception(:stream, :drain, mono, %{kind: ..., ...}, config)
 
   @base [:broadway_cloud_pub_sub, :streaming]
 
@@ -53,6 +58,86 @@ defmodule BroadwayCloudPubSub.Streaming.Telemetry do
       {result, stop_metadata} = fun.()
       {result, maybe_put_extra(stop_metadata, extra)}
     end)
+  end
+
+  @doc """
+  Emits the `:start` event for an async span under
+  `[:broadway_cloud_pub_sub, :streaming, layer, event, :start]`.
+
+  Measurements follow `:telemetry.span/3` conventions:
+  `%{system_time: System.system_time(), monotonic_time: monotonic_now}`.
+  Any `extra_measurements` are merged into the measurements map.
+
+  Returns the monotonic start time (nanoseconds) so the caller can compute
+  `duration` when emitting the matching `:stop` or `:exception`.
+  """
+  @spec emit_span_start(atom(), atom(), map(), map(), term()) :: integer()
+  def emit_span_start(layer, event, metadata, extra_measurements \\ %{}, telemetry_metadata) do
+    now_mono = System.monotonic_time()
+
+    measurements =
+      Map.merge(
+        %{system_time: System.system_time(), monotonic_time: now_mono},
+        extra_measurements
+      )
+
+    :telemetry.execute(
+      @base ++ [layer, event, :start],
+      measurements,
+      maybe_put_extra(metadata, resolve_extra(telemetry_metadata))
+    )
+
+    now_mono
+  end
+
+  @doc """
+  Emits the `:stop` event for an async span under
+  `[:broadway_cloud_pub_sub, :streaming, layer, event, :stop]`.
+
+  `start_mono` must be the value returned by the matching `emit_span_start/5` call.
+  `duration` is computed as `now - start_mono` in native time units.
+  """
+  @spec emit_span_stop(atom(), atom(), integer(), map(), term()) :: :ok
+  def emit_span_stop(layer, event, start_mono, metadata, telemetry_metadata) do
+    now_mono = System.monotonic_time()
+
+    :telemetry.execute(
+      @base ++ [layer, event, :stop],
+      %{duration: now_mono - start_mono, monotonic_time: now_mono},
+      maybe_put_extra(metadata, resolve_extra(telemetry_metadata))
+    )
+  end
+
+  @doc """
+  Emits the `:exception` event for an async span under
+  `[:broadway_cloud_pub_sub, :streaming, layer, event, :exception]`.
+
+  `start_mono` must be the value returned by the matching `emit_span_start/5` call.
+  `duration` is computed as `now - start_mono` in native time units.
+  Any `extra_measurements` are merged into the measurements map.
+  """
+  @spec emit_span_exception(atom(), atom(), integer(), map(), map(), term()) :: :ok
+  def emit_span_exception(
+        layer,
+        event,
+        start_mono,
+        metadata,
+        extra_measurements \\ %{},
+        telemetry_metadata
+      ) do
+    now_mono = System.monotonic_time()
+
+    measurements =
+      Map.merge(
+        %{duration: now_mono - start_mono, monotonic_time: now_mono},
+        extra_measurements
+      )
+
+    :telemetry.execute(
+      @base ++ [layer, event, :exception],
+      measurements,
+      maybe_put_extra(metadata, resolve_extra(telemetry_metadata))
+    )
   end
 
   # --- Private ---
