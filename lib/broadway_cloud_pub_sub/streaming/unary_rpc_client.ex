@@ -173,7 +173,14 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
     }
 
     grpc_client = state.grpc_client
-    do_rpc(state, ack_ids, request, &grpc_client.modify_ack_deadline/3, "modify ack deadline for messages")
+
+    do_rpc(
+      state,
+      ack_ids,
+      request,
+      &grpc_client.modify_ack_deadline/3,
+      "modify ack deadline for messages"
+    )
   end
 
   @impl GenServer
@@ -224,19 +231,25 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryRpcClient do
   # Chunks ack_ids into batches of @max_ack_ids_per_request and calls `call_fn`
   # for each chunk. Accumulates failed chunks. Stops on hard process errors.
   defp chunked_rpc(_pid, ack_ids, call_fn) do
-    ack_ids
-    |> Enum.chunk_every(@max_ack_ids_per_request)
-    |> Enum.reduce({:ok, []}, fn
-      chunk, {:ok, failed_so_far} ->
-        case call_fn.(chunk) do
-          :ok -> {:ok, failed_so_far}
-          {:error, _reason} -> {:ok, failed_so_far ++ chunk}
-        end
+    result =
+      ack_ids
+      |> Enum.chunk_every(@max_ack_ids_per_request)
+      |> Enum.reduce({:ok, []}, fn
+        chunk, {:ok, failed_so_far} ->
+          case call_fn.(chunk) do
+            :ok -> {:ok, failed_so_far}
+            {:error, _reason} -> {:ok, [chunk | failed_so_far]}
+          end
 
-      _chunk, {:error, _} = err ->
-        # Hard process error — don't attempt remaining chunks
-        err
-    end)
+        _chunk, {:error, _} = err ->
+          # Hard process error — don't attempt remaining chunks
+          err
+      end)
+
+    case result do
+      {:ok, failed} -> {:ok, List.flatten(failed)}
+      error -> error
+    end
   catch
     :exit, reason ->
       {:error, {:call_failed, reason}}

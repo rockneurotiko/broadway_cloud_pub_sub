@@ -53,20 +53,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
   defp run(manager, channel, config) do
     grpc_client = config.grpc_client
     grpc_client_config = config.grpc_client_config
-    client_id = Map.fetch!(config, :client_id)
 
-    initial_request = %StreamingPullRequest{
-      subscription: config.subscription,
-      stream_ack_deadline_seconds: config.stream_ack_deadline_seconds,
-      max_outstanding_messages: config.max_outstanding_messages,
-      max_outstanding_bytes: config.max_outstanding_bytes,
-      client_id: client_id
-    }
-
-    grpc_stream = grpc_client.streaming_pull(channel, grpc_client_config)
-
-    {:ok, grpc_stream} =
-      grpc_client.send_request(grpc_stream, initial_request, grpc_client_config)
+    grpc_stream = open_stream(channel, config)
 
     # Notify the manager that the stream is open. The manager needs the
     # grpc_stream struct to call send_request for acks and deadline
@@ -77,6 +65,25 @@ defmodule BroadwayCloudPubSub.Streaming.StreamReader do
       {:ok, enum} -> enumerate(enum, manager)
       {:error, error} -> send(manager, {:stream_error, error})
     end
+  end
+
+  defp open_stream(channel, config) do
+    grpc_client = config.grpc_client
+    grpc_client_config = config.grpc_client_config
+    client_id = Map.fetch!(config, :client_id)
+
+    initial_request = %StreamingPullRequest{
+      subscription: config.subscription,
+      stream_ack_deadline_seconds: config.stream_ack_deadline_seconds,
+      max_outstanding_messages: config.max_outstanding_messages,
+      max_outstanding_bytes: config.max_outstanding_bytes,
+      client_id: client_id
+    }
+
+    stream = grpc_client.streaming_pull(channel, grpc_client_config)
+    # Intentional match to crash if the stream fails to open
+    {:ok, stream} = grpc_client.send_request(stream, initial_request, grpc_client_config)
+    stream
   end
 
   defp enumerate(enum, manager) do

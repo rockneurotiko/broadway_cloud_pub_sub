@@ -19,6 +19,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     :batch_interval_ms,
     :batch_max_size,
     :timer_ref,
+    # Registered name of the Task.Supervisor for receipt modack tasks.
+    :task_supervisor,
     # nil = no deadline. Set to 600_000ms when exactly-once delivery is enabled.
     retry_deadline_ms: nil,
     ack_ids: [],
@@ -39,7 +41,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     :retry_deadline_ms,
     :broadway_name,
     :telemetry_metadata,
-    :rpc_client
+    :rpc_client,
+    :task_supervisor
   ]
 
   @required_keys [
@@ -47,7 +50,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     :ack_batch_interval_ms,
     :ack_batch_max_size,
     :broadway_name,
-    :rpc_client
+    :rpc_client,
+    :task_supervisor
   ]
 
   @doc false
@@ -132,7 +136,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
       telemetry_metadata: config[:telemetry_metadata],
       batch_interval_ms: config.ack_batch_interval_ms,
       batch_max_size: config.ack_batch_max_size,
-      retry_deadline_ms: config[:retry_deadline_ms]
+      retry_deadline_ms: config[:retry_deadline_ms],
+      task_supervisor: config[:task_supervisor]
     }
 
     {:ok, schedule_flush(state)}
@@ -189,15 +194,15 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     {:noreply, %{state | retry_deadline_ms: retry_deadline_ms}}
   end
 
-  # Receipt modack for exactly-once delivery. Spawns a Task that calls
-  # UnaryRpcClient directly (bypassing batching) and sends the result back
-  # to the caller. The Task is fire-and-forget from AckBatcher's perspective.
+  # Receipt modack for exactly-once delivery. Spawns a supervised Task that
+  # calls UnaryRpcClient directly (bypassing batching) and sends the result
+  # back to the caller. The Task is fire-and-forget from AckBatcher's
+  # perspective, but is supervised so it's cleaned up on pipeline shutdown.
   def handle_cast({:receipt_modack, ref, reply_to, ack_ids, deadline_seconds}, state) do
     rpc_client = state.rpc_client
 
-    Task.start(fn ->
-      result = UnaryRpcClient.modify_ack_deadline(rpc_client, ack_ids, deadline_seconds)
-      send(reply_to, {:receipt_modack_result, ref, result})
+    Task.Supervisor.start_child(state.task_supervisor, fn ->
+      do_receipt_modack(rpc_client, ref, reply_to, ack_ids, deadline_seconds)
     end)
 
     {:noreply, state}
@@ -412,6 +417,22 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     end
 
     %{state | timer_ref: nil}
+  end
+
+  # Executes a receipt modack RPC and always sends the result to `reply_to`,
+  # even if the RPC raises or the process it calls is dead. This prevents
+  # pending_receipt_modacks entries from being orphaned in StreamManager.
+  defp do_receipt_modack(rpc_client, ref, reply_to, ack_ids, deadline_seconds) do
+    result =
+      try do
+        UnaryRpcClient.modify_ack_deadline(rpc_client, ack_ids, deadline_seconds)
+      rescue
+        e -> {:error, {:receipt_modack_crashed, Exception.message(e)}}
+      catch
+        kind, reason -> {:error, {:receipt_modack_crashed, {kind, reason}}}
+      end
+
+    send(reply_to, {:receipt_modack_result, ref, result})
   end
 
   defp emit_telemetry(event, measurements, state) do

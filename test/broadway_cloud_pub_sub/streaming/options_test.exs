@@ -337,13 +337,19 @@ defmodule BroadwayCloudPubSub.Streaming.OptionsTest do
     end
 
     test "accepts any static term (keyword list, atom, string)" do
-      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: [a: 1])
+      {:ok, opts} =
+        validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: [a: 1])
+
       assert opts[:telemetry_metadata] == [a: 1]
 
-      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: :my_tag)
+      {:ok, opts} =
+        validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: :my_tag)
+
       assert opts[:telemetry_metadata] == :my_tag
 
-      {:ok, opts} = validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: "label")
+      {:ok, opts} =
+        validate(subscription: "projects/p/subscriptions/s", telemetry_metadata: "label")
+
       assert opts[:telemetry_metadata] == "label"
     end
 
@@ -481,8 +487,7 @@ defmodule BroadwayCloudPubSub.Streaming.ProducerPrepareForStartTest do
     [
       name: TestPipeline,
       producer: [
-        module:
-          {Producer, Keyword.merge(base_producer_opts, producer_opts)},
+        module: {Producer, Keyword.merge(base_producer_opts, producer_opts)},
         concurrency: 1
       ],
       processors: [default: []]

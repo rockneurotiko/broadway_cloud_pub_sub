@@ -59,10 +59,14 @@ defmodule BroadwayCloudPubSub.MixProject do
       groups_for_modules: [
         Pull: [
           BroadwayCloudPubSub.Producer,
-          BroadwayCloudPubSub.Client
+          BroadwayCloudPubSub.Client,
+          BroadwayCloudPubSub.PullClient
         ],
         Streaming: [
-          BroadwayCloudPubSub.Streaming.Producer
+          BroadwayCloudPubSub.Streaming.Producer,
+          BroadwayCloudPubSub.Streaming.Client,
+          BroadwayCloudPubSub.Streaming.GrpcClient,
+          BroadwayCloudPubSub.Streaming.Options
         ]
       ]
     ]

@@ -220,7 +220,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
         * Any module — A custom module implementing the `GRPC.Client.Adapter`
           behaviour. Useful for test adapters and alternative implementations.
 
-      Both built-in adapters are provided by the `grpc_client` dependency. The
+      Both built-in adapters are provided by the `grpc` dependency. The
       adapter choice does not affect the public API or message semantics.
       """
     ],
@@ -304,7 +304,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       doc: """
       The module implementing the `BroadwayCloudPubSub.Streaming.Client` behaviour.
       Defaults to `BroadwayCloudPubSub.Streaming.GrpcClient`, which uses the
-      `grpc_client` library to communicate with Google Cloud Pub/Sub.
+      `grpc` library to communicate with Google Cloud Pub/Sub.
 
       Swap this for testing or custom gRPC transports.
       """

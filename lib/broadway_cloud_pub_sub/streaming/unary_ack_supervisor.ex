@@ -39,6 +39,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryAckSupervisor do
 
     rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
     batcher_name = Module.concat(broadway_name, AckBatcher)
+    task_sup_name = Module.concat(broadway_name, ReceiptModackTaskSupervisor)
 
     # Each child's child_opts/1 selects only the keys it needs from the
     # full config and validates that all required keys are present.
@@ -50,6 +51,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryAckSupervisor do
     batcher_opts =
       config
       |> Keyword.put(:rpc_client, rpc_client_name)
+      |> Keyword.put(:task_supervisor, task_sup_name)
       |> AckBatcher.child_opts()
       |> Keyword.put(:name, batcher_name)
 
@@ -59,6 +61,10 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryAckSupervisor do
         start: {UnaryRpcClient, :start_link, [rpc_client_opts]},
         restart: :permanent
       },
+      # Task.Supervisor for receipt modack RPCs (exactly-once delivery).
+      # Started before AckBatcher so it's available when AckBatcher spawns tasks.
+      # Tasks are :temporary — they run once and are not restarted on failure.
+      {Task.Supervisor, name: task_sup_name},
       %{
         id: AckBatcher,
         start: {AckBatcher, :start_link, [batcher_opts]},

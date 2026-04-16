@@ -93,7 +93,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckTimeDistribution do
   def percentile(%__MODULE__{buckets: buckets, total: total}, p)
       when is_number(p) and p >= 0.0 and p <= 1.0 do
     target = max(1, ceil(p * total))
-    find_percentile_bucket(buckets, target, 0, 0)
+    find_percentile_bucket(buckets, target, @min_deadline_seconds, 0)
   end
 
   @doc """

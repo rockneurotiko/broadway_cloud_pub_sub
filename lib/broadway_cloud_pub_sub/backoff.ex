@@ -43,6 +43,11 @@ defmodule BroadwayCloudPubSub.Backoff do
         nil
 
       :rand_exp ->
+        # `lower` prevents the randomized minimum from dropping below max/3,
+        # ensuring backoff stays meaningful even after many retries. With
+        # defaults (min=100, max=60_000), the minimum eventually floors at
+        # 20s rather than continuing to start from 100ms. This matches the
+        # gax library's backoff behavior.
         lower = max(min, div(max, 3))
         %__MODULE__{type: :rand_exp, min: min, max: max, state: {min, lower, seed()}}
 

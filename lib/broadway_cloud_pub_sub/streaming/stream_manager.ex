@@ -249,11 +249,21 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     else
       # Standard delivery: fire-and-forget receipt modack, dispatch immediately.
       new_outstanding =
-        MessageDispatch.add_to_outstanding(state.outstanding, ack_ids, now, state.config.max_extension_ms)
+        MessageDispatch.add_to_outstanding(
+          state.outstanding,
+          ack_ids,
+          now,
+          state.config.max_extension_ms
+        )
 
       AckBatcher.modack(state.ack_batcher, ack_ids, adaptive_deadline)
       emit_telemetry(:receive_messages, %{count: length(broadway_messages)}, state.config)
-      {:noreply, MessageDispatch.deliver_messages(%{state | outstanding: new_outstanding}, broadway_messages)}
+
+      {:noreply,
+       MessageDispatch.deliver_messages(
+         %{state | outstanding: new_outstanding},
+         broadway_messages
+       )}
     end
   end
 
@@ -425,6 +435,10 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     # instead of waiting for their ack deadlines to expire naturally. This also
     # empties the outstanding map so the producer's terminate/2 becomes a no-op.
     nack_per_on_shutdown(state, outstanding_ids)
+
+    # Flush the batcher to ensure the nacks above are sent to the server
+    # before the connection is torn down by close_stream.
+    flush_batcher_if_alive(state.ack_batcher)
 
     {:noreply, close_stream(%{state | drain_timer: nil, drain_started_at: nil, outstanding: %{}})}
   end
@@ -627,12 +641,22 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   defp reset_connection(state, reason) do
-    # Drop buffered messages on disconnect; their ack_ids are already in outstanding
-    # so removing them avoids pointless lease-extension for messages that will redeliver.
+    # Drop buffered messages on disconnect and nack them so they become
+    # immediately available for redelivery to any consumer in the subscription.
+    # Without the nack, redelivery depends on either this client reconnecting
+    # (same client_id) or the ack deadline expiring naturally (up to 600s).
     buffered_ack_ids = MessageDispatch.extract_buffered_ack_ids(state.message_buffer)
+
+    AckBatcher.modack(state.ack_batcher, buffered_ack_ids, 0)
 
     new_outstanding = Enum.reduce(buffered_ack_ids, state.outstanding, &Map.delete(&2, &1))
 
+    # Dispatched ack_ids (sent to the producer but not yet acked) are intentionally
+    # kept in `outstanding`. Since the same `client_id` is used on reconnection,
+    # Pub/Sub associates the new stream with the same logical subscriber and won't
+    # redeliver those messages. They remain in outstanding until acked/nacked by
+    # the processor, or until `max_extension_ms` expiry in the lease extension cycle.
+    #
     # Preserve pending_demand across reconnection to avoid a demand deadlock.
     # See decisions.md.
     close_stream(
@@ -815,12 +839,19 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         )
 
         {:noreply,
-         MessageDispatch.deliver_messages(%{state | outstanding: new_outstanding}, pending.broadway_messages)}
+         MessageDispatch.deliver_messages(
+           %{state | outstanding: new_outstanding},
+           pending.broadway_messages
+         )}
 
       {:ok, failed_ids} ->
         # Partial success — deliver only messages whose modack succeeded.
         {ok_msgs, ok_ids} =
-          MessageDispatch.partition_succeeded(pending.broadway_messages, pending.ack_ids, failed_ids)
+          MessageDispatch.partition_succeeded(
+            pending.broadway_messages,
+            pending.ack_ids,
+            failed_ids
+          )
 
         new_outstanding =
           MessageDispatch.add_to_outstanding(
@@ -832,7 +863,9 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
         if ok_msgs != [] do
           emit_telemetry(:receive_messages, %{count: length(ok_msgs)}, state.config)
-          {:noreply, MessageDispatch.deliver_messages(%{state | outstanding: new_outstanding}, ok_msgs)}
+
+          {:noreply,
+           MessageDispatch.deliver_messages(%{state | outstanding: new_outstanding}, ok_msgs)}
         else
           {:noreply, %{state | outstanding: new_outstanding}}
         end

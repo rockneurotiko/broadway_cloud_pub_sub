@@ -75,11 +75,16 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
     # Start stub RPC client so AckBatcher can call it
     {:ok, _stub} = StubRpcClient.start_link(rpc_client_name)
 
+    # Start a Task.Supervisor for receipt modack tasks
+    task_sup_name = Module.concat(broadway_name, ReceiptModackTaskSupervisor)
+    {:ok, _task_sup} = Task.Supervisor.start_link(name: task_sup_name)
+
     # Start a real AckBatcher registered under the name StreamManager will use
     {:ok, _batcher} =
       AckBatcher.start_link(
         name: batcher_name,
         rpc_client: rpc_client_name,
+        task_supervisor: task_sup_name,
         ack_batch_interval_ms: Keyword.get(opts, :ack_batch_interval_ms, 100),
         ack_batch_max_size: Keyword.get(opts, :ack_batch_max_size, 2_500)
       )
@@ -1404,16 +1409,20 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
     rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
     batcher_name = Module.concat(broadway_name, AckBatcher)
+    task_sup_name = Module.concat(broadway_name, ReceiptModackTaskSupervisor)
 
     test_pid = self()
     {:ok, rpc_pid} = SpyRpcClientForEO.start_link(test_pid)
     # Register under the name AckBatcher will use
     Process.register(rpc_pid, rpc_client_name)
 
+    {:ok, _task_sup} = Task.Supervisor.start_link(name: task_sup_name)
+
     {:ok, _batcher} =
       AckBatcher.start_link(
         name: batcher_name,
         rpc_client: rpc_client_name,
+        task_supervisor: task_sup_name,
         ack_batch_interval_ms: Keyword.get(opts, :ack_batch_interval_ms, 50),
         ack_batch_max_size: Keyword.get(opts, :ack_batch_max_size, 2_500)
       )
@@ -1629,13 +1638,16 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
       batcher_name = Module.concat(broadway_name, AckBatcher)
+      task_sup_name = Module.concat(broadway_name, ReceiptModackTaskSupervisor)
 
       {:ok, _stub} = StubRpcClient.start_link(rpc_client_name)
+      {:ok, _task_sup} = Task.Supervisor.start_link(name: task_sup_name)
 
       {:ok, _batcher} =
         AckBatcher.start_link(
           name: batcher_name,
           rpc_client: rpc_client_name,
+          task_supervisor: task_sup_name,
           ack_batch_interval_ms: 100,
           ack_batch_max_size: 2_500,
           retry_deadline_ms: 60_000
@@ -1686,13 +1698,16 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
       batcher_name = Module.concat(broadway_name, AckBatcher)
+      task_sup_name = Module.concat(broadway_name, ReceiptModackTaskSupervisor)
 
       {:ok, _stub} = StubRpcClient.start_link(rpc_client_name)
+      {:ok, _task_sup} = Task.Supervisor.start_link(name: task_sup_name)
 
       {:ok, _batcher} =
         AckBatcher.start_link(
           name: batcher_name,
           rpc_client: rpc_client_name,
+          task_supervisor: task_sup_name,
           ack_batch_interval_ms: 100,
           ack_batch_max_size: 2_500,
           retry_deadline_ms: 60_000
@@ -1744,13 +1759,16 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       rpc_client_name = Module.concat(broadway_name, UnaryRpcClient)
       batcher_name = Module.concat(broadway_name, AckBatcher)
+      task_sup_name = Module.concat(broadway_name, ReceiptModackTaskSupervisor)
 
       {:ok, _stub} = StubRpcClient.start_link(rpc_client_name)
+      {:ok, _task_sup} = Task.Supervisor.start_link(name: task_sup_name)
 
       {:ok, _batcher} =
         AckBatcher.start_link(
           name: batcher_name,
           rpc_client: rpc_client_name,
+          task_supervisor: task_sup_name,
           ack_batch_interval_ms: 100,
           ack_batch_max_size: 2_500
         )
@@ -2513,6 +2531,35 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       state = :sys.get_state(pid)
       refute Map.has_key?(state.outstanding, "buf-reconnect")
       assert buffer_length(pid) == 0
+    end
+
+    test "buffered messages are nacked with deadline 0 on disconnect" do
+      # When a stream disconnects, buffered messages should be nacked so they
+      # become immediately available for redelivery to any consumer, rather than
+      # waiting for the ack deadline to expire naturally.
+      {pid, _rpc} = start_manager_with_spy_rpc(backoff_min: 60_000)
+      StreamManager.notify_demand(pid, 0)
+
+      send(pid, {:stream_messages, [received_message("nack-buf-1", "data1")]})
+      send(pid, {:stream_messages, [received_message("nack-buf-2", "data2")]})
+      sync(pid)
+      assert buffer_length(pid) == 2
+
+      # Flush any pending modack calls from the initial receipt modack
+      flush_mailbox()
+
+      # Simulate retryable stream error to trigger reset_connection
+      send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
+      sync(pid)
+
+      # AckBatcher flushes on its timer; force a flush to capture the nack RPC
+      batcher = :sys.get_state(pid).ack_batcher
+      AckBatcher.flush(batcher)
+
+      # The spy RPC client should have received a modack with deadline 0 for the
+      # buffered ack_ids.
+      assert_receive {:rpc_call, {:modack, ids, 0}}, 1_000
+      assert Enum.sort(ids) == ["nack-buf-1", "nack-buf-2"]
     end
   end
 

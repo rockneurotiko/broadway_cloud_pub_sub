@@ -66,7 +66,7 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   Pub/Sub via unary RPCs at a configurable interval (`:ack_batch_interval_ms`,
   default 100ms) or when the batch reaches `:ack_batch_max_size` (default 2500).
   Batching is done on a separate unary connection, independently of the
-  streaming connection.
+  streaming connection. See [Telemetry](#module-telemetry) for ack-related events.
 
   ## Flow control
 
@@ -76,6 +76,9 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   StreamManager also tracks GenStage demand from the Producer and buffers
   messages internally when demand is zero, preventing unbounded mailbox growth.
+
+  See also [Lease management](#module-lease-management) for how message deadlines
+  are extended while flow control holds messages in the buffer.
 
   ## Lease management
 
@@ -87,7 +90,8 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   Messages are tracked until they are acknowledged, nacked, or until
   `:max_extension_ms` elapses (default 60 minutes), after which the server
   redelivers them. This prevents a stuck consumer from holding messages
-  indefinitely.
+  indefinitely. The `extend_leases` and `lease_expired` telemetry events
+  (see [Telemetry](#module-telemetry)) provide visibility into lease activity.
 
   ## Exactly-once delivery
 
@@ -100,7 +104,8 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
   For exactly-once subscriptions, increase `:retry_deadline_ms` to 600,000ms
   (10 minutes) to allow the unary RPC client enough time to retry transient
   ack failures — the server requires successful ack receipt before guaranteeing
-  exactly-once semantics.
+  exactly-once semantics. The library automatically adjusts `:retry_deadline_ms`
+  when the subscription's exactly-once status changes at runtime.
 
   ## Message ordering
 
@@ -121,6 +126,9 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     3. Waits up to `:drain_timeout_ms` (default 30s) for in-flight messages
        (dispatched to processors but not yet acked/nacked) to be processed.
     4. Force-closes the stream after the drain timeout.
+
+  The drain lifecycle is tracked via the `drain` telemetry span
+  (see [Telemetry](#module-telemetry)).
 
   ## Error handling
 
@@ -185,6 +193,12 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
       Metadata includes: `reason: term()` — the connection error.
 
+    * `:reconnect` — reconnect scheduled after a disconnect or connection
+      failure. The backoff delay indicates how long the StreamManager will
+      wait before the next connection attempt.
+
+      Measurements: `%{delay: pos_integer()}`
+
     * `:keepalive` — keep-alive ping sent on the gRPC connection.
 
       Measurements: `%{deadline: pos_integer()}`
@@ -196,6 +210,12 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
     * `:lease_expired` — outstanding messages dropped because they exceeded
       `:max_extension_ms`.
+
+      Measurements: `%{count: pos_integer()}`
+
+    * `:receipt_modack_stale` — pending receipt modack entries (exactly-once
+      delivery) that exceeded the 60-second staleness threshold were nacked
+      for fast redelivery. Emitted during the lease extension cycle.
 
       Measurements: `%{count: pos_integer()}`
 
@@ -467,6 +487,11 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
       # instead of waiting for their ack deadline to expire naturally. This
       # covers edge cases like on_failure: :noop (acknowledger does nothing) or
       # the drain timeout firing before all processors complete.
+      #
+      # nack_ack_ids sends a cast to StreamManager (which routes to AckBatcher),
+      # then close/1 calls flush_batcher_if_alive. Since the cast is enqueued
+      # in AckBatcher before the flush, the nacked ack_ids are included in the
+      # final flush to the server.
       outstanding = StreamManager.get_outstanding(manager_pid)
       nack_ack_ids(manager_pid, config, outstanding)
 
@@ -555,10 +580,6 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   def partition_by(%Broadway.Message{metadata: %{orderingKey: key}}) when is_binary(key) do
     :erlang.phash2(key)
-  end
-
-  def partition_by(%Broadway.Message{metadata: %{orderingKey: key}}) when is_integer(key) do
-    key
   end
 
   def partition_by(_) do

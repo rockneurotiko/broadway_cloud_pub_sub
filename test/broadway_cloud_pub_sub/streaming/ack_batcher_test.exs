@@ -81,6 +81,13 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
     end
   end
 
+  # Start a Task.Supervisor for receipt modack tasks.
+  # Returns the supervisor pid.
+  defp start_task_supervisor do
+    {:ok, sup} = Task.Supervisor.start_link()
+    sup
+  end
+
   # Start a spy RPC client + AckBatcher pair.
   # Returns {batcher_pid, rpc_client_pid}.
   defp start_batcher(extra_opts \\ []) do
@@ -95,7 +102,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
           broadway_name: :TestPipeline,
           subscription: "projects/test/subscriptions/test-sub",
           ack_batch_interval_ms: 50,
-          ack_batch_max_size: 10
+          ack_batch_max_size: 10,
+          task_supervisor: start_task_supervisor()
         ],
         extra_opts
       )
@@ -290,7 +298,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
         AckBatcher.start_link(
           rpc_client: flaky,
           ack_batch_interval_ms: 40,
-          ack_batch_max_size: 100
+          ack_batch_max_size: 100,
+          task_supervisor: start_task_supervisor()
         )
 
       AckBatcher.ack(batcher, ["id-1", "id-2"])
@@ -316,7 +325,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
         AckBatcher.start_link(
           rpc_client: selective,
           ack_batch_interval_ms: 40,
-          ack_batch_max_size: 100
+          ack_batch_max_size: 100,
+          task_supervisor: start_task_supervisor()
         )
 
       AckBatcher.modack(batcher, ["id-30"], 30)
@@ -346,7 +356,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
         AckBatcher.start_link(
           rpc_client: fake_name,
           ack_batch_interval_ms: 50,
-          ack_batch_max_size: 100
+          ack_batch_max_size: 100,
+          task_supervisor: start_task_supervisor()
         )
 
       AckBatcher.ack(batcher, ["id-orphan"])
@@ -495,7 +506,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
         AckBatcher.start_link(
           rpc_client: rpc,
           ack_batch_interval_ms: 30,
-          ack_batch_max_size: 100
+          ack_batch_max_size: 100,
+          task_supervisor: start_task_supervisor()
         )
 
       AckBatcher.modack(batcher, ["id-exhaust"], 30)
@@ -531,7 +543,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
         AckBatcher.start_link(
           rpc_client: rpc,
           ack_batch_interval_ms: 10_000,
-          ack_batch_max_size: 100
+          ack_batch_max_size: 100,
+          task_supervisor: start_task_supervisor()
         )
 
       # Add two ids with the same deadline; the rpc always fails
@@ -558,7 +571,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
         AckBatcher.start_link(
           rpc_client: rpc,
           ack_batch_interval_ms: 10_000,
-          ack_batch_max_size: 100
+          ack_batch_max_size: 100,
+          task_supervisor: start_task_supervisor()
         )
 
       AckBatcher.modack(batcher_b, ["id-bad", "id-good"], 30)
@@ -596,7 +610,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
             broadway_name: :TestPipeline,
             subscription: "projects/test/subscriptions/test-sub",
             ack_batch_interval_ms: 100_000,
-            ack_batch_max_size: 10_000
+            ack_batch_max_size: 10_000,
+            task_supervisor: start_task_supervisor()
           ],
           extra_opts
         )
@@ -716,6 +731,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
       broadway_name: MyPipeline,
       telemetry_metadata: %{env: :test},
       rpc_client: :some_rpc_client,
+      task_supervisor: :some_task_supervisor,
       # Extra keys that AckBatcher should NOT include
       grpc_client: BroadwayCloudPubSub.Streaming.GrpcClient,
       grpc_client_config: %{},
@@ -736,7 +752,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
                  :retry_deadline_ms,
                  :broadway_name,
                  :telemetry_metadata,
-                 :rpc_client
+                 :rpc_client,
+                 :task_supervisor
                ])
     end
 
@@ -791,6 +808,14 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
       opts = Keyword.delete(@full_opts, :ack_batch_interval_ms)
 
       assert_raise ArgumentError, ~r/missing required option :ack_batch_interval_ms/, fn ->
+        AckBatcher.child_opts(opts)
+      end
+    end
+
+    test "raises on missing required key :task_supervisor" do
+      opts = Keyword.delete(@full_opts, :task_supervisor)
+
+      assert_raise ArgumentError, ~r/missing required option :task_supervisor/, fn ->
         AckBatcher.child_opts(opts)
       end
     end

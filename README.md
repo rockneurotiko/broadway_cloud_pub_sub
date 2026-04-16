@@ -8,7 +8,7 @@ Documentation can be found at [https://hexdocs.pm/broadway_cloud_pub_sub](https:
 
 This project provides:
 
-* `BroadwayCloudPubSub.Producer` - A GenStage producer that continuously receives messages from a Pub/Sub subscription acknowledges them after being successfully processed.
+* `BroadwayCloudPubSub.Producer` - A GenStage producer that continuously receives messages from a Pub/Sub subscription and acknowledges them after being successfully processed.
 * `BroadwayCloudPubSub.Streaming.Producer` - A GenStage producer that uses the gRPC StreamingPull API for low-latency, push-based message delivery.
 * `BroadwayCloudPubSub.Client` - A generic behaviour to implement Pub/Sub clients.
 * `BroadwayCloudPubSub.PullClient` - Default REST client used by `BroadwayCloudPubSub.Producer`.
