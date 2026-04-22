@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `BroadwayCloudPubSub.Streaming.Producer` — a new Broadway producer that uses the
+  gRPC StreamingPull API for low-latency, push-based message delivery instead of
+  HTTP pull requests
+
+  - Server-side flow control via `:max_outstanding_messages` and `:max_outstanding_bytes`
+
+  - Automatic lease extension with adaptive p99 ack deadlines to prevent premature
+    message redelivery
+
+  - Batched ack/nack via a separate unary gRPC connection, independent of the streaming
+    connection
+
+  - Exactly-once delivery support, auto-detected from subscription properties at runtime
+
+  - Message ordering support via the `:enable_message_ordering` option
+
+  - Graceful shutdown with configurable drain timeout (`:drain_timeout_ms`)
+
+  - Telemetry events for stream lifecycle, ack batching, and gRPC spans
+
+  - Support for both Gun and Mint HTTP/2 adapters via the `:adapter` option
+
+  - Pub/Sub emulator support via `:grpc_endpoint` and `:use_ssl` options
+
+  - `BroadwayCloudPubSub.Streaming.Client` — behaviour for custom gRPC client
+    implementations
+
+  - `BroadwayCloudPubSub.Streaming.GrpcClient` — default gRPC client using the
+  `grpc` library
+
 ## [0.9.1] - 2024-06-21
 
 ### Changed
