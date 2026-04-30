@@ -848,14 +848,6 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
       assert result.expired_count == 0
     end
 
-    test ":ok (bare atom) is treated as full success" do
-      tracker = tracked_ack_tracker(["a1"])
-      result = AckBatcher.classify_ack_result(["a1"], :ok, tracker, now_ms())
-
-      assert result.live == []
-      assert result.expired_count == 0
-    end
-
     test "partial success retains remaining ids" do
       tracker = tracked_ack_tracker(["a1", "a2", "a3"])
 

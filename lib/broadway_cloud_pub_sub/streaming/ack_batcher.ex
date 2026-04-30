@@ -147,7 +147,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
 
   @impl GenServer
   def handle_cast({:ack, ack_ids}, state) do
-    now = System.monotonic_time(:millisecond)
+    now = now_ms()
     new_ids = ack_ids ++ state.ack_ids
     new_count = state.ack_count + length(ack_ids)
     ack_tracker = RetryTracker.track(state.ack_tracker, ack_ids, now)
@@ -164,7 +164,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
   end
 
   def handle_cast({:modack, ack_ids, deadline_seconds}, state) do
-    now = System.monotonic_time(:millisecond)
+    now = now_ms()
 
     new_modack_ids =
       Map.update(state.modack_ids, deadline_seconds, ack_ids, &(ack_ids ++ &1))
@@ -286,19 +286,9 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
   # --- Pure classification functions ---
 
   @typedoc "RPC result from UnaryRpcClient.acknowledge/2 or modify_ack_deadline/3."
-  @type rpc_result :: :ok | {:ok, [String.t()]} | {:error, term()}
+  @type rpc_result :: {:ok, [String.t()]} | {:error, term()}
 
-  @doc """
-  Given the ack_ids that were sent, the RPC result, and the current retry tracker,
-  returns the retained ack_ids, count of expired ids, and updated tracker.
-
-  The RPC result shapes are:
-    - `:ok`                          — full success (nothing retained)
-    - `{:ok, []}`                    — full success (nothing retained)
-    - `{:ok, remaining_ids}`         — partial success
-    - `{:error, {_err, transient}}`  — retryable failure with transient ids
-    - `{:error, _reason}`            — total failure, retain all
-  """
+  @doc false
   @spec classify_ack_result([String.t()], rpc_result(), RetryTracker.t(), integer()) ::
           %{live: [String.t()], expired_count: non_neg_integer(), tracker: RetryTracker.t()}
   def classify_ack_result(sent_ack_ids, rpc_result, ack_tracker, now_ms) do
@@ -311,13 +301,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     %{live: live, expired_count: length(expired), tracker: tracker}
   end
 
-  @doc """
-  Given per-group RPC results and the current retry tracker (with attempts
-  already recorded), returns the retained modack groups, counts of exhausted
-  and expired ids, and updated tracker.
-
-  `rpc_results` is a list of `{deadline, sent_ids, rpc_result}` tuples.
-  """
+  @doc false
   @spec classify_modack_results(
           [{non_neg_integer(), [String.t()], rpc_result()}],
           RetryTracker.t(),
@@ -381,7 +365,6 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
   end
 
   # Extracts the list of ack_ids that should be retained from an RPC result.
-  defp extract_retained_ids(_sent_ids, :ok), do: []
   defp extract_retained_ids(_sent_ids, {:ok, []}), do: []
   defp extract_retained_ids(_sent_ids, {:ok, remaining_ids}), do: remaining_ids
 

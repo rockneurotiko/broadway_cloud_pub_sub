@@ -324,11 +324,11 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         )
 
         emit_telemetry(:terminal_error, %{}, state.config, %{reason: error})
-        {:noreply, reset_connection(state, error)}
+        {:noreply, reset_connection(state)}
 
       :retryable ->
         emit_telemetry(:disconnect, %{}, state.config, %{reason: error})
-        {:noreply, reset_connection(state, error)}
+        {:noreply, reset_connection(state)}
     end
   end
 
@@ -347,7 +347,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
         state =
           state
-          |> reset_connection(error)
+          |> reset_connection()
           |> schedule_reconnect()
 
         {:noreply, state}
@@ -404,10 +404,10 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         timer = schedule_keepalive_after(state.config)
         {:noreply, %{state | grpc_stream: stream, keepalive_timer: timer}}
 
-      {:error, reason} ->
+      {:error, _reason} ->
         state =
           state
-          |> reset_connection({:send_failed, reason})
+          |> reset_connection()
           |> schedule_reconnect()
 
         {:noreply, state}
@@ -606,11 +606,11 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     emit_telemetry(:disconnect, %{}, state.config, %{reason: reason})
 
     if state.draining do
-      {:noreply, reset_connection(state, reason)}
+      {:noreply, reset_connection(state)}
     else
       state =
         state
-        |> reset_connection(reason)
+        |> reset_connection()
         |> schedule_reconnect()
 
       {:noreply, state}
@@ -664,7 +664,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     state.grpc_client.send_request(grpc_stream, request, state.grpc_client_config)
   end
 
-  defp reset_connection(state, _reason) do
+  defp reset_connection(state) do
     # Drop buffered messages on disconnect and nack them so they become
     # immediately available for redelivery to any consumer in the subscription.
     # Without the nack, redelivery depends on either this client reconnecting
@@ -689,14 +689,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   defp close_stream(%{reader_pid: nil, grpc_stream: nil} = state), do: state
 
   defp close_stream(state) do
-    s =
+    state =
       state
       |> stop_reader()
       |> cancel_grpc_stream()
       |> disconnect_channel()
       |> cancel_keepalive_timer()
 
-    %{s | reader_pid: nil, grpc_stream: nil, channel: nil, conn_pid: nil}
+    %{state | reader_pid: nil, grpc_stream: nil, channel: nil, conn_pid: nil}
   end
 
   defp stop_reader(%{reader_pid: nil} = state), do: state
@@ -842,9 +842,9 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   # --- Private: keep-alive ---
 
   defp schedule_keepalive_timer(state) do
-    s = cancel_keepalive_timer(state)
-    timer = schedule_keepalive_after(s.config)
-    %{s | keepalive_timer: timer}
+    state = cancel_keepalive_timer(state)
+    timer = schedule_keepalive_after(state.config)
+    %{state | keepalive_timer: timer}
   end
 
   defp schedule_keepalive_after(config) do
