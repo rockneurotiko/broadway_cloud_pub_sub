@@ -7,7 +7,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
 
   use GenServer
 
-  alias BroadwayCloudPubSub.Streaming.{Options, Telemetry, UnaryRpcClient}
+  alias BroadwayCloudPubSub.Streaming.{Options, RetryTracker, Telemetry, UnaryRpcClient}
 
   @max_modack_attempts 3
 
@@ -21,17 +21,14 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     :timer_ref,
     # Registered name of the Task.Supervisor for receipt modack tasks.
     :task_supervisor,
-    # nil = no deadline. Set to 600_000ms when exactly-once delivery is enabled.
-    retry_deadline_ms: nil,
     ack_ids: [],
     ack_count: 0,
     # %{deadline_seconds => [ack_id]}
     modack_ids: %{},
-    # Monotonic ms of when each ack_id was first queued; cleaned up on success or expiry.
-    ack_first_queued: %{},
-    modack_first_queued: %{},
-    # Per-ack-ID attempt count; cleaned up each flush via sweep over remaining_modacks.
-    modack_attempts: %{}
+    # RetryTracker for ack retry state (deadline-only, no attempt limit).
+    ack_tracker: nil,
+    # RetryTracker for modack retry state (deadline + 3-attempt limit).
+    modack_tracker: nil
   ]
 
   @all_keys [
@@ -136,8 +133,13 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
       telemetry_metadata: config[:telemetry_metadata],
       batch_interval_ms: config.ack_batch_interval_ms,
       batch_max_size: config.ack_batch_max_size,
-      retry_deadline_ms: config[:retry_deadline_ms],
-      task_supervisor: config[:task_supervisor]
+      task_supervisor: config[:task_supervisor],
+      ack_tracker: RetryTracker.new(retry_deadline_ms: config[:retry_deadline_ms]),
+      modack_tracker:
+        RetryTracker.new(
+          retry_deadline_ms: config[:retry_deadline_ms],
+          max_attempts: @max_modack_attempts
+        )
     }
 
     {:ok, schedule_flush(state)}
@@ -148,9 +150,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
     now = System.monotonic_time(:millisecond)
     new_ids = ack_ids ++ state.ack_ids
     new_count = state.ack_count + length(ack_ids)
-    # put_new: don't reset timestamp if this ack_id is already being retried
-    new_ts = Enum.reduce(ack_ids, state.ack_first_queued, &Map.put_new(&2, &1, now))
-    state = %{state | ack_ids: new_ids, ack_count: new_count, ack_first_queued: new_ts}
+    ack_tracker = RetryTracker.track(state.ack_tracker, ack_ids, now)
+    state = %{state | ack_ids: new_ids, ack_count: new_count, ack_tracker: ack_tracker}
 
     state =
       if new_count >= state.batch_max_size do
@@ -169,16 +170,9 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
       Map.update(state.modack_ids, deadline_seconds, ack_ids, &(ack_ids ++ &1))
 
     total_modack_count = new_modack_ids |> Map.values() |> Enum.map(&length/1) |> Enum.sum()
-    # put_new: don't reset timestamp or attempt count for already-tracked ids
-    new_ts = Enum.reduce(ack_ids, state.modack_first_queued, &Map.put_new(&2, &1, now))
-    new_attempts = Enum.reduce(ack_ids, state.modack_attempts, &Map.put_new(&2, &1, 0))
+    modack_tracker = RetryTracker.track(state.modack_tracker, ack_ids, now)
 
-    state = %{
-      state
-      | modack_ids: new_modack_ids,
-        modack_first_queued: new_ts,
-        modack_attempts: new_attempts
-    }
+    state = %{state | modack_ids: new_modack_ids, modack_tracker: modack_tracker}
 
     state =
       if state.ack_count + total_modack_count >= state.batch_max_size do
@@ -191,7 +185,13 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
   end
 
   def handle_cast({:update_retry_deadline, retry_deadline_ms}, state) do
-    {:noreply, %{state | retry_deadline_ms: retry_deadline_ms}}
+    {:noreply,
+     %{
+       state
+       | ack_tracker: RetryTracker.update_retry_deadline(state.ack_tracker, retry_deadline_ms),
+         modack_tracker:
+           RetryTracker.update_retry_deadline(state.modack_tracker, retry_deadline_ms)
+     }}
   end
 
   # Receipt modack for exactly-once delivery. Spawns a supervised Task that
@@ -247,157 +247,149 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
   defp flush_acks(%{ack_count: 0} = state), do: state
 
   defp flush_acks(state) do
-    case UnaryRpcClient.acknowledge(state.rpc_client, state.ack_ids) do
-      {:ok, []} ->
-        %{state | ack_ids: [], ack_count: 0, ack_first_queued: %{}}
+    rpc_result = UnaryRpcClient.acknowledge(state.rpc_client, state.ack_ids)
+    result = classify_ack_result(state.ack_ids, rpc_result, state.ack_tracker, now_ms())
 
-      {:ok, remaining_ids} ->
-        state |> put_retained_acks(remaining_ids) |> expire_stale_acks()
-
-      {:error, {_rpc_error, transient_ids}} when is_list(transient_ids) ->
-        # Permanent ids already dropped by UnaryRpcClient; retain only transient.
-        state |> put_retained_acks(transient_ids) |> expire_stale_acks()
-
-      {:error, _reason} ->
-        expire_stale_acks(state)
+    if result.expired_count > 0 do
+      emit_telemetry(:ack_retry_expired, %{count: result.expired_count}, state)
     end
+
+    %{state | ack_ids: result.live, ack_count: length(result.live), ack_tracker: result.tracker}
   end
 
   defp flush_modacks(%{modack_ids: modacks} = state) when map_size(modacks) == 0, do: state
 
   defp flush_modacks(state) do
     all_ids = state.modack_ids |> Map.values() |> List.flatten()
+    tracker = RetryTracker.record_attempt(state.modack_tracker, all_ids)
 
-    # Increment attempt count for all ids about to be flushed.
-    attempts =
-      Enum.reduce(all_ids, state.modack_attempts, fn id, acc ->
-        Map.update(acc, id, 1, &(&1 + 1))
+    # Call each deadline group's RPC and collect results.
+    rpc_results =
+      Enum.map(state.modack_ids, fn {deadline, ids} ->
+        rpc_result = UnaryRpcClient.modify_ack_deadline(state.rpc_client, ids, deadline)
+        {deadline, ids, rpc_result}
       end)
 
-    state = %{state | modack_attempts: attempts}
+    result = classify_modack_results(rpc_results, tracker, now_ms())
 
-    # Each deadline group is attempted independently.
-    remaining_modacks =
-      Enum.reduce(state.modack_ids, %{}, fn {deadline, ids}, remaining ->
-        case UnaryRpcClient.modify_ack_deadline(state.rpc_client, ids, deadline) do
-          {:ok, []} ->
-            remaining
+    if result.exhausted_count > 0 do
+      emit_telemetry(:modack_retry_exhausted, %{count: result.exhausted_count}, state)
+    end
 
-          {:ok, remaining_ids} ->
-            keep = apply_modack_retry_limit(remaining_ids, state.modack_attempts, state)
-            if keep == [], do: remaining, else: Map.put(remaining, deadline, keep)
+    if result.expired_count > 0 do
+      emit_telemetry(:modack_retry_expired, %{count: result.expired_count}, state)
+    end
 
-          {:error, {_rpc_error, transient_ids}} when is_list(transient_ids) ->
-            keep = apply_modack_retry_limit(transient_ids, state.modack_attempts, state)
-            if keep == [], do: remaining, else: Map.put(remaining, deadline, keep)
+    %{state | modack_ids: result.remaining, modack_tracker: result.tracker}
+  end
 
-          {:error, _reason} ->
-            keep = apply_modack_retry_limit(ids, state.modack_attempts, state)
-            if keep == [], do: remaining, else: Map.put(remaining, deadline, keep)
-        end
+  # --- Pure classification functions ---
+
+  @typedoc "RPC result from UnaryRpcClient.acknowledge/2 or modify_ack_deadline/3."
+  @type rpc_result :: :ok | {:ok, [String.t()]} | {:error, term()}
+
+  @doc """
+  Given the ack_ids that were sent, the RPC result, and the current retry tracker,
+  returns the retained ack_ids, count of expired ids, and updated tracker.
+
+  The RPC result shapes are:
+    - `:ok`                          — full success (nothing retained)
+    - `{:ok, []}`                    — full success (nothing retained)
+    - `{:ok, remaining_ids}`         — partial success
+    - `{:error, {_err, transient}}`  — retryable failure with transient ids
+    - `{:error, _reason}`            — total failure, retain all
+  """
+  @spec classify_ack_result([String.t()], rpc_result(), RetryTracker.t(), integer()) ::
+          %{live: [String.t()], expired_count: non_neg_integer(), tracker: RetryTracker.t()}
+  def classify_ack_result(sent_ack_ids, rpc_result, ack_tracker, now_ms) do
+    retained_ids = extract_retained_ids(sent_ack_ids, rpc_result)
+
+    retained_set = MapSet.new(retained_ids)
+    tracker = RetryTracker.retain_only(ack_tracker, retained_set)
+    {live, expired, tracker} = RetryTracker.expire_stale(tracker, retained_ids, now_ms)
+
+    %{live: live, expired_count: length(expired), tracker: tracker}
+  end
+
+  @doc """
+  Given per-group RPC results and the current retry tracker (with attempts
+  already recorded), returns the retained modack groups, counts of exhausted
+  and expired ids, and updated tracker.
+
+  `rpc_results` is a list of `{deadline, sent_ids, rpc_result}` tuples.
+  """
+  @spec classify_modack_results(
+          [{non_neg_integer(), [String.t()], rpc_result()}],
+          RetryTracker.t(),
+          integer()
+        ) ::
+          %{
+            remaining: %{non_neg_integer() => [String.t()]},
+            exhausted_count: non_neg_integer(),
+            expired_count: non_neg_integer(),
+            tracker: RetryTracker.t()
+          }
+  def classify_modack_results(rpc_results, modack_tracker, now_ms) do
+    # Each deadline group is processed independently. Thread the tracker
+    # through each group so attempt-limit checks use the latest counts.
+    {remaining_modacks, tracker, total_exhausted} =
+      Enum.reduce(rpc_results, {%{}, modack_tracker, 0}, fn
+        {deadline, sent_ids, rpc_result}, {remaining, trk, exhausted_acc} ->
+          result_ids = extract_retained_ids(sent_ids, rpc_result)
+
+          if result_ids == [] do
+            {remaining, trk, exhausted_acc}
+          else
+            {keep, drop, trk} = RetryTracker.check_attempts(trk, result_ids)
+
+            remaining =
+              if keep == [], do: remaining, else: Map.put(remaining, deadline, keep)
+
+            {remaining, trk, exhausted_acc + length(drop)}
+          end
       end)
 
     # Cleanup sweep: bound tracking maps to currently-pending ids only.
     still_pending = remaining_modacks |> Map.values() |> List.flatten() |> MapSet.new()
+    tracker = RetryTracker.retain_only(tracker, still_pending)
 
-    clean_attempts =
-      Map.filter(state.modack_attempts, fn {id, _} -> MapSet.member?(still_pending, id) end)
+    # Expire stale modack ids that have exceeded the retry deadline.
+    still_pending_list = MapSet.to_list(still_pending)
 
-    clean_ts =
-      Map.filter(state.modack_first_queued, fn {id, _} -> MapSet.member?(still_pending, id) end)
+    {_live_ids, expired_ids, tracker} =
+      RetryTracker.expire_stale(tracker, still_pending_list, now_ms)
 
-    state = %{
-      state
-      | modack_ids: remaining_modacks,
-        modack_attempts: clean_attempts,
-        modack_first_queued: clean_ts
-    }
+    # Remove expired ids from remaining_modacks.
+    remaining_modacks =
+      if expired_ids == [] do
+        remaining_modacks
+      else
+        expired_set = MapSet.new(expired_ids)
 
-    expire_stale_modacks(state)
-  end
-
-  # Drops modack ids that have reached the maximum attempt count and emits telemetry.
-  defp apply_modack_retry_limit(ids, attempts, state) do
-    {keep, drop} =
-      Enum.split_with(ids, fn id -> Map.get(attempts, id, 0) < @max_modack_attempts end)
-
-    if drop != [] do
-      emit_telemetry(:modack_retry_exhausted, %{count: length(drop)}, state)
-    end
-
-    keep
-  end
-
-  # Replaces the pending ack_ids with the given retained set and cleans up
-  # ack_first_queued to contain only the retained ids.
-  defp put_retained_acks(state, retained_ids) do
-    retained_set = MapSet.new(retained_ids)
-
-    clean_ts =
-      Map.filter(state.ack_first_queued, fn {id, _} -> MapSet.member?(retained_set, id) end)
-
-    %{state | ack_ids: retained_ids, ack_count: length(retained_ids), ack_first_queued: clean_ts}
-  end
-
-  defp expire_stale_acks(%{retry_deadline_ms: nil} = state), do: state
-
-  defp expire_stale_acks(state) do
-    now = System.monotonic_time(:millisecond)
-
-    {live, expired} =
-      Enum.split_with(state.ack_ids, fn id ->
-        case Map.get(state.ack_first_queued, id) do
-          nil -> true
-          ts -> now - ts < state.retry_deadline_ms
-        end
-      end)
-
-    if expired != [] do
-      emit_telemetry(:ack_retry_expired, %{count: length(expired)}, state)
-    end
-
-    clean_ts = Map.drop(state.ack_first_queued, expired)
-    %{state | ack_ids: live, ack_count: length(live), ack_first_queued: clean_ts}
-  end
-
-  defp expire_stale_modacks(%{retry_deadline_ms: nil} = state), do: state
-
-  defp expire_stale_modacks(state) do
-    now = System.monotonic_time(:millisecond)
-
-    {remaining_modacks, expired_count} =
-      Enum.reduce(state.modack_ids, {%{}, 0}, fn {deadline, ids}, {acc, dropped} ->
-        {live, expired} =
-          Enum.split_with(ids, fn id ->
-            case Map.get(state.modack_first_queued, id) do
-              nil -> true
-              ts -> now - ts < state.retry_deadline_ms
-            end
-          end)
-
-        acc = if live == [], do: acc, else: Map.put(acc, deadline, live)
-        {acc, dropped + length(expired)}
-      end)
-
-    if expired_count > 0 do
-      emit_telemetry(:modack_retry_expired, %{count: expired_count}, state)
-    end
-
-    still_pending = remaining_modacks |> Map.values() |> List.flatten() |> MapSet.new()
-
-    clean_ts =
-      Map.filter(state.modack_first_queued, fn {id, _} -> MapSet.member?(still_pending, id) end)
-
-    clean_attempts =
-      Map.filter(state.modack_attempts, fn {id, _} -> MapSet.member?(still_pending, id) end)
+        remaining_modacks
+        |> Enum.map(fn {d, ids} -> {d, Enum.reject(ids, &MapSet.member?(expired_set, &1))} end)
+        |> Enum.reject(fn {_, ids} -> ids == [] end)
+        |> Map.new()
+      end
 
     %{
-      state
-      | modack_ids: remaining_modacks,
-        modack_first_queued: clean_ts,
-        modack_attempts: clean_attempts
+      remaining: remaining_modacks,
+      exhausted_count: total_exhausted,
+      expired_count: length(expired_ids),
+      tracker: tracker
     }
   end
+
+  # Extracts the list of ack_ids that should be retained from an RPC result.
+  defp extract_retained_ids(_sent_ids, :ok), do: []
+  defp extract_retained_ids(_sent_ids, {:ok, []}), do: []
+  defp extract_retained_ids(_sent_ids, {:ok, remaining_ids}), do: remaining_ids
+
+  defp extract_retained_ids(_sent_ids, {:error, {_rpc_error, transient_ids}})
+       when is_list(transient_ids),
+       do: transient_ids
+
+  defp extract_retained_ids(sent_ids, {:error, _reason}), do: sent_ids
 
   defp schedule_flush(state) do
     state = cancel_timer(state)
@@ -434,6 +426,8 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcher do
 
     send(reply_to, {:receipt_modack_result, ref, result})
   end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp emit_telemetry(event, measurements, state) do
     metadata = %{

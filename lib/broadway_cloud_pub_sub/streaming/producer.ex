@@ -354,7 +354,7 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   use GenStage
 
-  alias BroadwayCloudPubSub.Streaming.{StreamManager, UnaryAckSupervisor, Options}
+  alias BroadwayCloudPubSub.Streaming.{AckBatcher, StreamManager, UnaryAckSupervisor, Options}
 
   @behaviour Broadway.Producer
 
@@ -418,9 +418,16 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
     # Start our own StreamManager directly. start_link creates a natural
     # bidirectional link — if the manager crashes (terminal gRPC error), the
     # producer receives an EXIT signal; if the producer dies, the manager does too.
+    ack_batcher = Module.concat(broadway_name, AckBatcher)
+
     manager_opts =
       opts
-      |> Keyword.merge(name: manager_name, producer_pid: self(), ack_ref: ack_ref)
+      |> Keyword.merge(
+        name: manager_name,
+        producer_pid: self(),
+        ack_ref: ack_ref,
+        ack_batcher: ack_batcher
+      )
 
     {:ok, manager_pid} = StreamManager.start_link(manager_opts)
 

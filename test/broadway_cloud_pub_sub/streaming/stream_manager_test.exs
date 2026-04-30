@@ -89,11 +89,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         ack_batch_max_size: Keyword.get(opts, :ack_batch_max_size, 2_500)
       )
 
-    # Pass producer_pid and ack_ref directly (matching what Producer.init does)
+    # Pass producer_pid, ack_ref, and ack_batcher directly (matching what Producer.init does)
     opts =
       opts
       |> Keyword.put(:producer_pid, self())
       |> Keyword.put(:ack_ref, {broadway_name, 0})
+      |> Keyword.put(:ack_batcher, batcher_name)
 
     {:ok, pid} = StreamManager.start_link(opts)
 
@@ -500,15 +501,15 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       StreamManager.prepare_for_draining(pid)
 
       # Manually set a reconnect_ref to simulate a pending reconnect
-      :sys.replace_state(pid, fn s -> %{s | reconnect_ref: make_ref()} end)
+      :sys.replace_state(pid, fn s -> %{s | conn: %{s.conn | reconnect_ref: make_ref()}} end)
 
       send(pid, :connect)
       sync(pid)
 
       state = :sys.get_state(pid)
       # reconnect_ref should be cleared but no new connection started
-      assert state.reconnect_ref == nil
-      assert state.reader_pid == nil
+      assert state.conn.reconnect_ref == nil
+      assert state.conn.reader_pid == nil
     end
 
     test "retryable stream_error during drain does not schedule reconnect" do
@@ -518,8 +519,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       # Cancel any existing reconnect timer from initial connect failure
       :sys.replace_state(pid, fn s ->
-        if s.reconnect_ref, do: Process.cancel_timer(s.reconnect_ref)
-        %{s | reconnect_ref: nil}
+        if s.conn.reconnect_ref, do: Process.cancel_timer(s.conn.reconnect_ref)
+        %{s | conn: %{s.conn | reconnect_ref: nil}}
       end)
 
       send(pid, {:stream_error, %GRPC.RPCError{status: 14, message: "unavailable"}})
@@ -527,8 +528,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       state = :sys.get_state(pid)
       # No new reconnect scheduled during drain
-      assert state.reconnect_ref == nil
-      assert state.reader_pid == nil
+      assert state.conn.reconnect_ref == nil
+      assert state.conn.reader_pid == nil
       assert Process.alive?(pid)
     end
 
@@ -683,7 +684,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       # during the test assertions.
       pid = start_manager(keepalive_interval_ms: 10, backoff_min: 60_000)
 
-      :sys.replace_state(pid, fn s -> %{s | grpc_stream: :fake_stream} end)
+      :sys.replace_state(pid, fn s -> %{s | conn: %{s.conn | grpc_stream: :fake_stream}} end)
 
       # Bootstrap the keepalive cycle — normally started by {:stream_opened},
       # but we injected the stream directly via replace_state.
@@ -698,8 +699,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       # After a send failure, the stream is reset (grpc_stream: nil) and a
       # reconnect is scheduled.
       state = :sys.get_state(pid)
-      assert state.grpc_stream == nil
-      assert state.reconnect_ref != nil
+      assert state.conn.grpc_stream == nil
+      assert state.conn.reconnect_ref != nil
     end
 
     test "does not crash when stream is nil (reconnecting)" do
@@ -717,7 +718,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       pid = start_manager()
       # No public API for keepalive_timer — :sys.get_state required
       state = :sys.get_state(pid)
-      assert state.keepalive_timer == nil
+      assert state.conn.keepalive_timer == nil
     end
 
     test "keepalive_timer is set when stream is active" do
@@ -726,7 +727,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       with_live_stream([keepalive_interval_ms: 60_000], fn pid, _ctrl ->
         # No public API for keepalive_timer — :sys.get_state required
         state = :sys.get_state(pid)
-        assert state.keepalive_timer != nil
+        assert state.conn.keepalive_timer != nil
       end)
     end
   end
@@ -747,7 +748,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       # No public API for reconnect_ref — :sys.get_state required
       state = :sys.get_state(pid)
-      first_ref = state.reconnect_ref
+      first_ref = state.conn.reconnect_ref
 
       # Ref must be set (at least one reconnect scheduled)
       assert first_ref != nil
@@ -757,7 +758,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       sync(pid)
 
       state2 = :sys.get_state(pid)
-      assert state2.reconnect_ref == first_ref
+      assert state2.conn.reconnect_ref == first_ref
     end
 
     test "reconnect_ref is cleared when :connect message fires" do
@@ -840,7 +841,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       # No public API for reconnect_ref — :sys.get_state required
       state = :sys.get_state(pid)
-      assert state.reconnect_ref != nil
+      assert state.conn.reconnect_ref != nil
     end
 
     test "UNAVAILABLE (14) with 'Server shutdownNow invoked' schedules reconnect without stopping" do
@@ -858,7 +859,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert Process.alive?(pid)
 
       state = :sys.get_state(pid)
-      assert state.reconnect_ref != nil
+      assert state.conn.reconnect_ref != nil
     end
 
     test "terminal error emits :terminal_error telemetry before stopping" do
@@ -988,7 +989,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert Process.alive?(pid)
 
       state = :sys.get_state(pid)
-      assert state.reconnect_ref != nil
+      assert state.conn.reconnect_ref != nil
     end
 
     test "UNAVAILABLE (14) without shutdown message schedules reconnect" do
@@ -1431,6 +1432,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       opts
       |> Keyword.put(:producer_pid, self())
       |> Keyword.put(:ack_ref, {broadway_name, 0})
+      |> Keyword.put(:ack_batcher, batcher_name)
 
     {:ok, pid} = StreamManager.start_link(opts)
 
@@ -1657,11 +1659,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         opts
         |> Keyword.put(:producer_pid, self())
         |> Keyword.put(:ack_ref, {broadway_name, 0})
+        |> Keyword.put(:ack_batcher, batcher_name)
 
       {:ok, pid} = StreamManager.start_link(opts)
 
       batcher_pid = Process.whereis(batcher_name)
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 60_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 60_000
 
       # Enable exactly-once
       send(
@@ -1677,7 +1680,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       # Cast is async — let AckBatcher process it
       AckBatcher.flush(batcher_pid)
 
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 600_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 600_000
     end
 
     test "AckBatcher retry_deadline_ms is restored to configured value when exactly-once is disabled" do
@@ -1717,6 +1720,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         opts
         |> Keyword.put(:producer_pid, self())
         |> Keyword.put(:ack_ref, {broadway_name, 0})
+        |> Keyword.put(:ack_batcher, batcher_name)
 
       {:ok, pid} = StreamManager.start_link(opts)
 
@@ -1724,7 +1728,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       enable_exactly_once(pid)
       AckBatcher.flush(batcher_pid)
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 600_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 600_000
 
       # Disable exactly-once
       send(
@@ -1738,7 +1742,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       sync(pid)
       AckBatcher.flush(batcher_pid)
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 60_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 60_000
     end
 
     test "retry_deadline_ms is NOT updated when exactly_once status does not change" do
@@ -1777,11 +1781,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
         opts
         |> Keyword.put(:producer_pid, self())
         |> Keyword.put(:ack_ref, {broadway_name, 0})
+        |> Keyword.put(:ack_batcher, batcher_name)
 
       {:ok, pid} = StreamManager.start_link(opts)
 
       batcher_pid = Process.whereis(batcher_name)
-      initial_deadline = :sys.get_state(batcher_pid).retry_deadline_ms
+      initial_deadline = :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms
 
       # Send the same exactly_once=false twice — no update should happen
       send(
@@ -1796,7 +1801,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       sync(pid)
       AckBatcher.flush(batcher_pid)
 
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == initial_deadline
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == initial_deadline
     end
   end
 
@@ -2320,8 +2325,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       # Cancel any pre-existing reconnect (from initial failed connection attempt)
       # so we can cleanly assert there's no reconnect scheduled after the stream_error.
       :sys.replace_state(pid, fn s ->
-        if s.reconnect_ref, do: Process.cancel_timer(s.reconnect_ref)
-        %{s | reconnect_ref: nil}
+        if s.conn.reconnect_ref, do: Process.cancel_timer(s.conn.reconnect_ref)
+        %{s | conn: %{s.conn | reconnect_ref: nil}}
       end)
 
       # Stream disconnects while we're draining (common race)
@@ -2333,7 +2338,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       state = :sys.get_state(pid)
       assert state.draining == true
       # No reconnect scheduled during drain
-      assert state.reconnect_ref == nil
+      assert state.conn.reconnect_ref == nil
 
       # Ack completes — drain should finish
       StreamManager.acknowledge(pid, ["drain-err-1"])
@@ -2355,8 +2360,8 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       # Cancel any pre-existing reconnect from initial failed connection attempt
       :sys.replace_state(pid, fn s ->
-        if s.reconnect_ref, do: Process.cancel_timer(s.reconnect_ref)
-        %{s | reconnect_ref: nil}
+        if s.conn.reconnect_ref, do: Process.cancel_timer(s.conn.reconnect_ref)
+        %{s | conn: %{s.conn | reconnect_ref: nil}}
       end)
 
       # Server closes stream (normal — no reconnect during drain)
@@ -2366,7 +2371,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       assert Process.alive?(pid)
       state = :sys.get_state(pid)
       assert state.draining == true
-      assert state.reconnect_ref == nil
+      assert state.conn.reconnect_ref == nil
 
       # Ack the in-flight message — drain completes
       StreamManager.acknowledge(pid, ["drain-close-1"])

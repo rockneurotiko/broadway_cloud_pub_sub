@@ -197,4 +197,22 @@ defmodule BroadwayCloudPubSub.Streaming.AcknowledgerTest do
       assert length(batch2) == 500
     end
   end
+
+  describe "ack_id_from/1" do
+    test "extracts ack_id from a Broadway.Message" do
+      ack_ref = make_ref()
+      msg = build_message("test-ack-id", ack_ref)
+
+      assert Acknowledger.ack_id_from(msg) == "test-ack-id"
+    end
+
+    test "works with different ack_ids" do
+      ack_ref = make_ref()
+
+      for id <- ["a", "b", "long-ack-id-with-many-chars"] do
+        msg = build_message(id, ack_ref)
+        assert Acknowledger.ack_id_from(msg) == id
+      end
+    end
+  end
 end

@@ -449,14 +449,16 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
 
       # Default is nil (not configured in start_batcher)
       state = :sys.get_state(batcher)
-      assert state.retry_deadline_ms == nil
+      assert state.ack_tracker.retry_deadline_ms == nil
+      assert state.modack_tracker.retry_deadline_ms == nil
 
       AckBatcher.update_retry_deadline(batcher, 600_000)
       # Cast is async — sync via flush
       AckBatcher.flush(batcher)
 
       state = :sys.get_state(batcher)
-      assert state.retry_deadline_ms == 600_000
+      assert state.ack_tracker.retry_deadline_ms == 600_000
+      assert state.modack_tracker.retry_deadline_ms == 600_000
     end
 
     test "restores configured deadline when exactly-once is disabled" do
@@ -464,11 +466,13 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
 
       AckBatcher.update_retry_deadline(batcher, 600_000)
       AckBatcher.flush(batcher)
-      assert :sys.get_state(batcher).retry_deadline_ms == 600_000
+      assert :sys.get_state(batcher).ack_tracker.retry_deadline_ms == 600_000
+      assert :sys.get_state(batcher).modack_tracker.retry_deadline_ms == 600_000
 
       AckBatcher.update_retry_deadline(batcher, 60_000)
       AckBatcher.flush(batcher)
-      assert :sys.get_state(batcher).retry_deadline_ms == 60_000
+      assert :sys.get_state(batcher).ack_tracker.retry_deadline_ms == 60_000
+      assert :sys.get_state(batcher).modack_tracker.retry_deadline_ms == 60_000
     end
   end
 
@@ -525,7 +529,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
       # State should be clear
       state = :sys.get_state(batcher)
       assert state.modack_ids == %{}
-      assert state.modack_attempts == %{}
+      assert state.modack_tracker.attempts == %{}
     end
 
     test "other ack_ids are not affected by one id reaching the retry limit" do
@@ -820,4 +824,151 @@ defmodule BroadwayCloudPubSub.Streaming.AckBatcherTest do
       end
     end
   end
+
+  # --- Pure classification function tests ---
+
+  describe "classify_ack_result/4" do
+    alias BroadwayCloudPubSub.Streaming.RetryTracker
+
+    defp new_ack_tracker(opts) do
+      RetryTracker.new(opts)
+    end
+
+    defp tracked_ack_tracker(ids, opts \\ []) do
+      tracker = new_ack_tracker(opts)
+      now = System.monotonic_time(:millisecond)
+      RetryTracker.track(tracker, ids, now)
+    end
+
+    test "full success returns empty live list" do
+      tracker = tracked_ack_tracker(["a1", "a2"])
+      result = AckBatcher.classify_ack_result(["a1", "a2"], {:ok, []}, tracker, now_ms())
+
+      assert result.live == []
+      assert result.expired_count == 0
+    end
+
+    test ":ok (bare atom) is treated as full success" do
+      tracker = tracked_ack_tracker(["a1"])
+      result = AckBatcher.classify_ack_result(["a1"], :ok, tracker, now_ms())
+
+      assert result.live == []
+      assert result.expired_count == 0
+    end
+
+    test "partial success retains remaining ids" do
+      tracker = tracked_ack_tracker(["a1", "a2", "a3"])
+
+      result =
+        AckBatcher.classify_ack_result(["a1", "a2", "a3"], {:ok, ["a2"]}, tracker, now_ms())
+
+      assert result.live == ["a2"]
+      assert result.expired_count == 0
+    end
+
+    test "retryable error with transient ids retains those ids" do
+      tracker = tracked_ack_tracker(["a1", "a2"])
+      rpc_result = {:error, {%GRPC.RPCError{status: 14}, ["a1"]}}
+      result = AckBatcher.classify_ack_result(["a1", "a2"], rpc_result, tracker, now_ms())
+
+      assert result.live == ["a1"]
+      assert result.expired_count == 0
+    end
+
+    test "total failure retains all ids" do
+      tracker = tracked_ack_tracker(["a1", "a2"])
+
+      result =
+        AckBatcher.classify_ack_result(["a1", "a2"], {:error, :unavailable}, tracker, now_ms())
+
+      assert result.live == ["a1", "a2"]
+      assert result.expired_count == 0
+    end
+
+    test "expired ids are dropped and counted" do
+      tracker = new_ack_tracker(retry_deadline_ms: 100)
+      old_time = now_ms() - 200
+      tracker = RetryTracker.track(tracker, ["a1", "a2"], old_time)
+
+      result =
+        AckBatcher.classify_ack_result(["a1", "a2"], {:error, :unavailable}, tracker, now_ms())
+
+      assert result.live == []
+      assert result.expired_count == 2
+    end
+  end
+
+  describe "classify_modack_results/3" do
+    alias BroadwayCloudPubSub.Streaming.RetryTracker
+
+    test "full success for all groups returns empty remaining" do
+      tracker = RetryTracker.new(max_attempts: 3)
+      tracker = RetryTracker.track(tracker, ["m1", "m2"], now_ms())
+      tracker = RetryTracker.record_attempt(tracker, ["m1", "m2"])
+
+      rpc_results = [{60, ["m1"], {:ok, []}}, {0, ["m2"], {:ok, []}}]
+      result = AckBatcher.classify_modack_results(rpc_results, tracker, now_ms())
+
+      assert result.remaining == %{}
+      assert result.exhausted_count == 0
+      assert result.expired_count == 0
+    end
+
+    test "partial failure retains failed ids in the correct deadline group" do
+      tracker = RetryTracker.new(max_attempts: 3)
+      tracker = RetryTracker.track(tracker, ["m1", "m2"], now_ms())
+      tracker = RetryTracker.record_attempt(tracker, ["m1", "m2"])
+
+      rpc_results = [{60, ["m1", "m2"], {:ok, ["m2"]}}]
+      result = AckBatcher.classify_modack_results(rpc_results, tracker, now_ms())
+
+      assert result.remaining == %{60 => ["m2"]}
+      assert result.exhausted_count == 0
+    end
+
+    test "ids exceeding max_attempts are dropped" do
+      tracker = RetryTracker.new(max_attempts: 2)
+      tracker = RetryTracker.track(tracker, ["m1"], now_ms())
+      # Simulate 2 prior attempts
+      tracker = RetryTracker.record_attempt(tracker, ["m1"])
+      tracker = RetryTracker.record_attempt(tracker, ["m1"])
+
+      rpc_results = [{60, ["m1"], {:error, :unavailable}}]
+      result = AckBatcher.classify_modack_results(rpc_results, tracker, now_ms())
+
+      assert result.remaining == %{}
+      assert result.exhausted_count == 1
+    end
+
+    test "expired modack ids are dropped and counted" do
+      tracker = RetryTracker.new(max_attempts: 10, retry_deadline_ms: 100)
+      old_time = now_ms() - 200
+      tracker = RetryTracker.track(tracker, ["m1"], old_time)
+      tracker = RetryTracker.record_attempt(tracker, ["m1"])
+
+      rpc_results = [{60, ["m1"], {:error, :unavailable}}]
+      result = AckBatcher.classify_modack_results(rpc_results, tracker, now_ms())
+
+      assert result.remaining == %{}
+      assert result.expired_count == 1
+    end
+
+    test "multiple deadline groups are tracked independently" do
+      tracker = RetryTracker.new(max_attempts: 3)
+      tracker = RetryTracker.track(tracker, ["a", "b", "c"], now_ms())
+      tracker = RetryTracker.record_attempt(tracker, ["a", "b", "c"])
+
+      rpc_results = [
+        {60, ["a"], {:ok, ["a"]}},
+        {0, ["b", "c"], {:ok, ["c"]}}
+      ]
+
+      result = AckBatcher.classify_modack_results(rpc_results, tracker, now_ms())
+
+      assert result.remaining == %{60 => ["a"], 0 => ["c"]}
+      assert result.exhausted_count == 0
+    end
+  end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
 end
