@@ -14,3 +14,9 @@ plugins:
       - paths=source_relative
       - include_docs=true
       - plugins=grpc
+    # To add a new RPC in the future, append its fully-qualified method path
+    # here and re-run: buf generate
+    types:
+      - google.pubsub.v1.Subscriber.StreamingPull
+      - google.pubsub.v1.Subscriber.Acknowledge
+      - google.pubsub.v1.Subscriber.ModifyAckDeadline
