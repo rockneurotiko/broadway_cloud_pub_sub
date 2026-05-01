@@ -36,6 +36,16 @@ defmodule BroadwayCloudPubSub.Streaming.Acknowledger do
     &{__MODULE__, ack_ref, %{ack_id: &1}}
   end
 
+  @doc """
+  Extracts the ack_id from a `Broadway.Message` produced by this acknowledger.
+
+  This is the canonical extraction point for ack_ids — callers should use this
+  instead of pattern-matching on the acknowledger tuple's internal structure.
+  """
+  @spec ack_id_from(Broadway.Message.t()) :: String.t()
+  def ack_id_from(%Broadway.Message{acknowledger: {__MODULE__, _ref, %{ack_id: ack_id}}}),
+    do: ack_id
+
   @impl Acknowledger
   def ack(ack_ref, successful, failed) do
     # persistent_term stores the manager's registered *name*, not its PID,
@@ -78,7 +88,7 @@ defmodule BroadwayCloudPubSub.Streaming.Acknowledger do
   defp default_action(:on_success, %{on_success: action}), do: action
   defp default_action(:on_failure, %{on_failure: action}), do: action
 
-  defp extract_ack_id(%{acknowledger: {_, _, %{ack_id: ack_id}}}), do: ack_id
+  defp extract_ack_id(message), do: ack_id_from(message)
 
   defp dispatch_acks(actions_and_ids, manager_server) do
     Enum.each(actions_and_ids, fn {action, ack_ids} ->

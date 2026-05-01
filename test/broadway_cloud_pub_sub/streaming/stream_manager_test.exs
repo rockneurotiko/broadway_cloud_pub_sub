@@ -1661,7 +1661,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       {:ok, pid} = StreamManager.start_link(opts)
 
       batcher_pid = Process.whereis(batcher_name)
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 60_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 60_000
 
       # Enable exactly-once
       send(
@@ -1677,7 +1677,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       # Cast is async — let AckBatcher process it
       AckBatcher.flush(batcher_pid)
 
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 600_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 600_000
     end
 
     test "AckBatcher retry_deadline_ms is restored to configured value when exactly-once is disabled" do
@@ -1724,7 +1724,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       enable_exactly_once(pid)
       AckBatcher.flush(batcher_pid)
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 600_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 600_000
 
       # Disable exactly-once
       send(
@@ -1738,7 +1738,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
 
       sync(pid)
       AckBatcher.flush(batcher_pid)
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == 60_000
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == 60_000
     end
 
     test "retry_deadline_ms is NOT updated when exactly_once status does not change" do
@@ -1781,7 +1781,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       {:ok, pid} = StreamManager.start_link(opts)
 
       batcher_pid = Process.whereis(batcher_name)
-      initial_deadline = :sys.get_state(batcher_pid).retry_deadline_ms
+      initial_deadline = :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms
 
       # Send the same exactly_once=false twice — no update should happen
       send(
@@ -1796,7 +1796,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManagerTest do
       sync(pid)
       AckBatcher.flush(batcher_pid)
 
-      assert :sys.get_state(batcher_pid).retry_deadline_ms == initial_deadline
+      assert :sys.get_state(batcher_pid).ack_tracker.retry_deadline_ms == initial_deadline
     end
   end
 

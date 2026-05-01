@@ -186,25 +186,23 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   def handle_info(:connect, state) do
-    state = %{state | reconnect_ref: nil}
-    do_connect(state)
+    %{state | reconnect_ref: nil}
+    |> do_connect()
   end
 
   # The StreamReader successfully opened the gRPC stream and sends us the
   # stream struct so we can call send_request for acks and lease extensions.
   def handle_info({:stream_opened, reader_pid, grpc_stream}, %{reader_pid: reader_pid} = state) do
-    conn_pid = grpc_stream.channel.adapter_payload.conn_pid
-    backoff = Backoff.reset(state.backoff)
+    state =
+      %{
+        state
+        | grpc_stream: grpc_stream,
+          conn_pid: grpc_stream.channel.adapter_payload.conn_pid,
+          backoff: Backoff.reset(state.backoff)
+      }
+      |> schedule_lease_timer()
+      |> schedule_keepalive_timer()
 
-    state = %{
-      state
-      | grpc_stream: grpc_stream,
-        conn_pid: conn_pid,
-        backoff: backoff
-    }
-
-    state = LeaseManager.schedule_lease_timer(state)
-    state = schedule_keepalive_timer(state)
     emit_telemetry(:connect, %{}, state.config)
     {:noreply, state}
   end
@@ -221,16 +219,18 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   def handle_info({:stream_messages, messages}, %{draining: true} = state) do
     nack_per_on_shutdown(state, Enum.map(messages, & &1.ack_id))
-
     {:noreply, state}
   end
 
   def handle_info({:stream_messages, messages}, state) do
-    broadway_messages = Enum.map(messages, &MessageDispatch.build_broadway_message(&1, state))
-    ack_ids = Enum.map(messages, & &1.ack_id)
+    broadway_messages =
+      Enum.map(messages, &MessageDispatch.build_broadway_message(&1, state.config.ack_ref))
 
+    ack_ids = Enum.map(messages, & &1.ack_id)
     now = now_ms()
-    adaptive_deadline = LeaseManager.effective_deadline(state)
+
+    adaptive_deadline =
+      LeaseManager.effective_deadline(state.ack_time_dist, state.exactly_once_enabled)
 
     if state.exactly_once_enabled do
       # Exactly-once receipt modack gate: hold messages until the receipt modack
@@ -259,11 +259,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       AckBatcher.modack(state.ack_batcher, ack_ids, adaptive_deadline)
       emit_telemetry(:receive_messages, %{count: length(broadway_messages)}, state.config)
 
-      {:noreply,
-       MessageDispatch.deliver_messages(
-         %{state | outstanding: new_outstanding},
-         broadway_messages
-       )}
+      {:noreply, enqueue_and_flush(%{state | outstanding: new_outstanding}, broadway_messages)}
     end
   end
 
@@ -328,11 +324,11 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         )
 
         emit_telemetry(:terminal_error, %{}, state.config, %{reason: error})
-        {:noreply, reset_connection(state, error)}
+        {:noreply, reset_connection(state)}
 
       :retryable ->
         emit_telemetry(:disconnect, %{}, state.config, %{reason: error})
-        {:noreply, reset_connection(state, error)}
+        {:noreply, reset_connection(state)}
     end
   end
 
@@ -348,7 +344,13 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
       :retryable ->
         emit_telemetry(:disconnect, %{}, state.config, %{reason: error})
-        {:noreply, schedule_reconnect(reset_connection(state, error))}
+
+        state =
+          state
+          |> reset_connection()
+          |> schedule_reconnect()
+
+        {:noreply, state}
     end
   end
 
@@ -382,7 +384,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   def handle_info(:extend_leases, state) do
-    {:noreply, LeaseManager.do_extend_leases(state)}
+    {:noreply, do_extend_leases(state)}
   end
 
   # Periodic keep-alive ping to prevent the server from closing an idle stream.
@@ -391,7 +393,9 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   end
 
   def handle_info(:send_keepalive, state) do
-    adaptive_deadline = LeaseManager.effective_deadline(state)
+    adaptive_deadline =
+      LeaseManager.effective_deadline(state.ack_time_dist, state.exactly_once_enabled)
+
     keepalive_request = %StreamingPullRequest{stream_ack_deadline_seconds: adaptive_deadline}
 
     case send_on_stream(state.grpc_stream, keepalive_request, state) do
@@ -400,8 +404,13 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         timer = schedule_keepalive_after(state.config)
         {:noreply, %{state | grpc_stream: stream, keepalive_timer: timer}}
 
-      {:error, reason} ->
-        {:noreply, schedule_reconnect(reset_connection(state, {:send_failed, reason}))}
+      {:error, _reason} ->
+        state =
+          state
+          |> reset_connection()
+          |> schedule_reconnect()
+
+        {:noreply, state}
     end
   end
 
@@ -440,7 +449,11 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     # before the connection is torn down by close_stream.
     flush_batcher_if_alive(state.ack_batcher)
 
-    {:noreply, close_stream(%{state | drain_timer: nil, drain_started_at: nil, outstanding: %{}})}
+    state =
+      %{state | drain_timer: nil, drain_started_at: nil, outstanding: %{}}
+      |> close_stream()
+
+    {:noreply, state}
   end
 
   def handle_info(_msg, state) do
@@ -449,7 +462,10 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   @impl GenServer
   def handle_cast({:acknowledge, ack_ids}, state) do
-    state = MessageDispatch.record_and_remove_from_outstanding(state, ack_ids)
+    {new_outstanding, new_dist} =
+      MessageDispatch.record_and_remove(state.outstanding, state.ack_time_dist, ack_ids, now_ms())
+
+    state = %{state | outstanding: new_outstanding, ack_time_dist: new_dist}
 
     AckBatcher.ack(state.ack_batcher, ack_ids)
     emit_telemetry(:ack, %{count: length(ack_ids)}, state.config)
@@ -464,7 +480,10 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     # otherwise the periodic extend_leases cycle would override the requested
     # deadline, and the drain phase could never complete because outstanding
     # would never become empty.
-    state = MessageDispatch.record_and_remove_from_outstanding(state, ack_ids)
+    {new_outstanding, new_dist} =
+      MessageDispatch.record_and_remove(state.outstanding, state.ack_time_dist, ack_ids, now_ms())
+
+    state = %{state | outstanding: new_outstanding, ack_time_dist: new_dist}
 
     AckBatcher.modack(state.ack_batcher, ack_ids, deadline_seconds)
 
@@ -474,8 +493,11 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   # The producer signals a demand delta. Accumulate it and flush up to the new
   # total from the message buffer.
   def handle_cast({:demand_available, amount}, state) do
-    state = %{state | pending_demand: state.pending_demand + amount}
-    {:noreply, MessageDispatch.flush_demand(state)}
+    state =
+      %{state | pending_demand: state.pending_demand + amount}
+      |> do_flush_demand()
+
+    {:noreply, state}
   end
 
   @impl GenServer
@@ -497,14 +519,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
     try do
       # 1. Close the reader FIRST to stop new messages from arriving.
-      state = close_reader(state)
-
       # 2. Nack pending receipt modacks so the server redelivers them quickly.
-      state = nack_pending_receipt_modacks(state)
+      state =
+        state
+        |> close_reader()
+        |> nack_pending_receipt_modacks()
 
       # 3. Extract ack_ids from buffered messages and nack them.
       buffered_ack_ids = MessageDispatch.extract_buffered_ack_ids(state.message_buffer)
-
       nacked_count = length(buffered_ack_ids)
       nack_per_on_shutdown(state, buffered_ack_ids)
 
@@ -512,19 +534,17 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       new_outstanding =
         Enum.reduce(buffered_ack_ids, state.outstanding, &Map.delete(&2, &1))
 
-      state = %{
-        state
-        | message_buffer: :queue.new(),
-          outstanding: new_outstanding,
-          draining: true,
-          drain_started_at: drain_started_at
-      }
-
-      # 5. Start the drain timer.
-      state = start_drain_timer(state)
-
-      # 6. Check if drain is already complete (outstanding may now be empty).
-      state = maybe_complete_drain(state)
+      # 5–6. Set draining state, start drain timer, check if already complete.
+      state =
+        %{
+          state
+          | message_buffer: :queue.new(),
+            outstanding: new_outstanding,
+            draining: true,
+            drain_started_at: drain_started_at
+        }
+        |> start_drain_timer()
+        |> maybe_complete_drain()
 
       {:reply, {:ok, nacked_count}, state}
     rescue
@@ -549,8 +569,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   def handle_call(:close, _from, state) do
     # Best-effort flush; AckBatcher may already be down during pipeline shutdown.
     flush_batcher_if_alive(state.ack_batcher)
-    state = close_stream(state)
-    {:reply, :ok, state}
+    {:reply, :ok, close_stream(state)}
   end
 
   @impl GenServer
@@ -570,7 +589,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     end
 
     state
-    |> LeaseManager.cancel_lease_timer()
+    |> cancel_lease_timer()
     |> cancel_keepalive_timer()
     |> cancel_drain_timer()
     |> close_stream()
@@ -587,9 +606,14 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     emit_telemetry(:disconnect, %{}, state.config, %{reason: reason})
 
     if state.draining do
-      {:noreply, reset_connection(state, reason)}
+      {:noreply, reset_connection(state)}
     else
-      {:noreply, schedule_reconnect(reset_connection(state, reason))}
+      state =
+        state
+        |> reset_connection()
+        |> schedule_reconnect()
+
+      {:noreply, state}
     end
   end
 
@@ -640,13 +664,12 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     state.grpc_client.send_request(grpc_stream, request, state.grpc_client_config)
   end
 
-  defp reset_connection(state, reason) do
+  defp reset_connection(state) do
     # Drop buffered messages on disconnect and nack them so they become
     # immediately available for redelivery to any consumer in the subscription.
     # Without the nack, redelivery depends on either this client reconnecting
     # (same client_id) or the ack deadline expiring naturally (up to 600s).
     buffered_ack_ids = MessageDispatch.extract_buffered_ack_ids(state.message_buffer)
-
     AckBatcher.modack(state.ack_batcher, buffered_ack_ids, 0)
 
     new_outstanding = Enum.reduce(buffered_ack_ids, state.outstanding, &Map.delete(&2, &1))
@@ -659,24 +682,22 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     #
     # Preserve pending_demand across reconnection to avoid a demand deadlock.
     # See decisions.md.
-    close_stream(
-      %{state | message_buffer: :queue.new(), outstanding: new_outstanding},
-      reason
-    )
+    %{state | message_buffer: :queue.new(), outstanding: new_outstanding}
+    |> close_stream()
   end
 
   defp close_stream(%{reader_pid: nil, grpc_stream: nil} = state), do: state
 
   defp close_stream(state) do
-    state
-    |> stop_reader()
-    |> cancel_grpc_stream()
-    |> disconnect_channel()
-    |> cancel_keepalive_timer()
-    |> then(&%{&1 | reader_pid: nil, grpc_stream: nil, channel: nil, conn_pid: nil})
-  end
+    state =
+      state
+      |> stop_reader()
+      |> cancel_grpc_stream()
+      |> disconnect_channel()
+      |> cancel_keepalive_timer()
 
-  defp close_stream(state, _reason), do: close_stream(state)
+    %{state | reader_pid: nil, grpc_stream: nil, channel: nil, conn_pid: nil}
+  end
 
   defp stop_reader(%{reader_pid: nil} = state), do: state
 
@@ -745,9 +766,78 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
   defp now_ms, do: System.monotonic_time(:millisecond)
 
-  # --- Private: lease extension (delegated to LeaseManager) ---
+  # --- Private: lease extension ---
 
-  # --- Private: lease management (delegated to LeaseManager) ---
+  defp do_extend_leases(state) do
+    now = now_ms()
+
+    %{
+      valid: valid,
+      expired_count: expired_count,
+      modack_ids: modack_ids,
+      modack_deadline: modack_deadline,
+      next_timer_ms: next_timer_ms
+    } =
+      LeaseManager.extend_leases(
+        state.outstanding,
+        state.ack_time_dist,
+        state.exactly_once_enabled,
+        now
+      )
+
+    if expired_count > 0 do
+      emit_telemetry(:lease_expired, %{count: expired_count}, state.config)
+    end
+
+    emit_telemetry(
+      :extend_leases,
+      %{count: map_size(valid), deadline: modack_deadline},
+      state.config
+    )
+
+    emit_telemetry(
+      :pressure_snapshot,
+      %{
+        outstanding_count: map_size(valid),
+        buffered_count: :queue.len(state.message_buffer),
+        pending_demand: state.pending_demand
+      },
+      state.config
+    )
+
+    if modack_ids != [] do
+      AckBatcher.modack(state.ack_batcher, modack_ids, modack_deadline)
+    end
+
+    timer = Process.send_after(self(), :extend_leases, next_timer_ms)
+
+    # Sweep stale pending receipt modacks.
+    %{fresh: fresh, stale_ack_ids: stale_ack_ids} =
+      LeaseManager.sweep_stale_pending_modacks(state.pending_receipt_modacks, now)
+
+    if stale_ack_ids != [] do
+      AckBatcher.modack(state.ack_batcher, stale_ack_ids, 0)
+      emit_telemetry(:receipt_modack_stale, %{count: length(stale_ack_ids)}, state.config)
+    end
+
+    %{state | outstanding: valid, lease_timer: timer, pending_receipt_modacks: fresh}
+  end
+
+  # --- Private: lease timer management ---
+
+  defp schedule_lease_timer(state) do
+    state = cancel_lease_timer(state)
+    interval = LeaseManager.initial_timer_ms(state.config.stream_ack_deadline_seconds)
+    timer = Process.send_after(self(), :extend_leases, interval)
+    %{state | lease_timer: timer}
+  end
+
+  defp cancel_lease_timer(%{lease_timer: nil} = state), do: state
+
+  defp cancel_lease_timer(%{lease_timer: timer} = state) do
+    Process.cancel_timer(timer)
+    %{state | lease_timer: nil}
+  end
 
   # --- Private: keep-alive ---
 
@@ -799,7 +889,6 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
          %{draining: true, outstanding: outstanding, pending_receipt_modacks: pending} = state
        )
        when map_size(outstanding) == 0 and map_size(pending) == 0 do
-    state = cancel_drain_timer(state)
     # AckBatcher may already be down during pipeline shutdown.
     flush_batcher_if_alive(state.ack_batcher)
 
@@ -811,14 +900,37 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
       Map.get(state.config, :telemetry_metadata)
     )
 
+    state = cancel_drain_timer(state)
     close_stream(%{state | drain_started_at: nil})
   end
 
   defp maybe_complete_drain(state), do: state
 
-  # --- Private: message dispatch (delegated to MessageDispatch) ---
+  # --- Private: message dispatch ---
 
-  # Stale pending receipt modacks sweeping is delegated to LeaseManager.
+  # Enqueues messages into the buffer and flushes up to pending_demand.
+  defp enqueue_and_flush(state, messages) do
+    new_buffer = Enum.reduce(messages, state.message_buffer, &:queue.in(&1, &2))
+
+    %{state | message_buffer: new_buffer}
+    |> do_flush_demand()
+  end
+
+  # Flushes up to pending_demand messages from the buffer to the producer.
+  # No-op when draining, demand is zero, or the buffer is empty.
+  defp do_flush_demand(%{draining: true} = state), do: state
+  defp do_flush_demand(%{pending_demand: 0} = state), do: state
+
+  defp do_flush_demand(state) do
+    %{to_send: to_send, remaining_buffer: remaining_buffer, remaining_demand: remaining_demand} =
+      MessageDispatch.flush_demand(state.message_buffer, state.pending_demand)
+
+    if to_send != [] do
+      send(state.producer_pid, {:stream_messages, to_send})
+    end
+
+    %{state | message_buffer: remaining_buffer, pending_demand: remaining_demand}
+  end
 
   # Handle the result of an exactly-once receipt modack RPC (non-draining path).
   defp handle_receipt_modack_success(state, pending, result) do
@@ -839,10 +951,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
         )
 
         {:noreply,
-         MessageDispatch.deliver_messages(
-           %{state | outstanding: new_outstanding},
-           pending.broadway_messages
-         )}
+         enqueue_and_flush(%{state | outstanding: new_outstanding}, pending.broadway_messages)}
 
       {:ok, failed_ids} ->
         # Partial success — deliver only messages whose modack succeeded.
@@ -863,9 +972,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
 
         if ok_msgs != [] do
           emit_telemetry(:receive_messages, %{count: length(ok_msgs)}, state.config)
-
-          {:noreply,
-           MessageDispatch.deliver_messages(%{state | outstanding: new_outstanding}, ok_msgs)}
+          {:noreply, enqueue_and_flush(%{state | outstanding: new_outstanding}, ok_msgs)}
         else
           {:noreply, %{state | outstanding: new_outstanding}}
         end
@@ -903,8 +1010,6 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
     nack_per_on_shutdown(state, pending_ids)
     %{state | pending_receipt_modacks: %{}}
   end
-
-  # Message construction is delegated to MessageDispatch.
 
   # Flush AckBatcher if its process is currently alive. Guards against the
   # batcher being down during pipeline shutdown (Broadway stops children in
