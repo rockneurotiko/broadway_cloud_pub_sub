@@ -1,1 +1,1 @@
-ExUnit.start(exclude: [:integration, :stress])
+ExUnit.start()
