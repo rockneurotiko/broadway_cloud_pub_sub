@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `BroadwayCloudPubSub.Streaming.GrpcClient` — default gRPC client using the
   `grpc` library
 
+## [1.0.0] - 2026-05-26
+
+### Changed
+
+- Automatically retry 408, 500, 502, 503, 504, 522, 524 errors
+
 ## [0.9.1] - 2024-06-21
 
 ### Changed
@@ -313,7 +319,8 @@ This version moves Cloud PubSub from Tesla to Finch, so read the notes below and
 - `BroadwayCloudPubSub.Token` - A generic behaviour to implement token authentication for Pub/Sub clients.
 - `BroadwayCloudPubSub.GothToken` - Default token provider used by `BroadwayCloudPubSub.Producer`.
 
-[Unreleased]: https://github.com/dashbitco/broadway_cloud_pub_sub/compare/v0.9.0...HEAD
+[1.0.0]: https://github.com/dashbitco/broadway_cloud_pub_sub/compare/v0.9.1...v1.0.0
+[0.9.1]: https://github.com/dashbitco/broadway_cloud_pub_sub/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/dashbitco/broadway_cloud_pub_sub/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/dashbitco/broadway_cloud_pub_sub/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/dashbitco/broadway_cloud_pub_sub/compare/v0.7.0...v0.7.1
