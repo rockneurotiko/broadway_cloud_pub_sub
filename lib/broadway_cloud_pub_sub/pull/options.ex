@@ -59,8 +59,12 @@ defmodule BroadwayCloudPubSub.Pull.Options do
       See the "Acknowledgements" section below for all the possible values.
       This option can also be changed for each message through
       `Broadway.Message.configure_ack/2`.
+
+      Defaults to `{:nack, 0}`, which makes failed messages immediately
+      available for redelivery. This matches the behaviour of the official
+      Google Cloud Pub/Sub client libraries.
       """,
-      default: :noop
+      default: {:nack, 0}
     ],
     on_success: [
       type:

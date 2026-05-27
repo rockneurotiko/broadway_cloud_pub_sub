@@ -89,10 +89,12 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
     ],
     on_failure: [
       type: {:custom, __MODULE__, :type_ack_option, [[{:name, :on_failure}]]},
-      default: :noop,
+      default: {:nack, 0},
       doc: """
       Configures the acknowledgement behaviour for failed messages.
-      Defaults to `:noop`.
+      Defaults to `{:nack, 0}`, which makes failed messages immediately
+      available for redelivery. This matches the behaviour of the official
+      Google Cloud Pub/Sub client libraries.
       """
     ],
     on_shutdown: [

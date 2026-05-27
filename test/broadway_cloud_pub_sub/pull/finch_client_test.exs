@@ -652,7 +652,7 @@ defmodule BroadwayCloudPubSub.Pull.FinchClientTest do
       base_url: Keyword.fetch!(base_opts, :base_url),
       client: FinchClient,
       finch: Keyword.fetch!(base_opts, :finch),
-      on_failure: base_opts[:on_failure] || :noop,
+      on_failure: base_opts[:on_failure] || {:nack, 0},
       on_success: base_opts[:on_success] || :ack,
       subscription: "projects/test/subscriptions/test-subscription",
       token_generator: {__MODULE__, :generate_token, []},

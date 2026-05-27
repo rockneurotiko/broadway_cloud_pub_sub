@@ -408,7 +408,7 @@ defmodule BroadwayCloudPubSub.Pull.ProducerTest do
       assert producer_opts[:on_success] == :ack
     end
 
-    test ":on_failure defaults to :noop" do
+    test ":on_failure defaults to {:nack, 0}" do
       assert {_,
               [
                 producer: [
@@ -422,7 +422,7 @@ defmodule BroadwayCloudPubSub.Pull.ProducerTest do
                  subscription: "projects/foo/subscriptions/bar"
                )
 
-      assert producer_opts[:on_failure] == :noop
+      assert producer_opts[:on_failure] == {:nack, 0}
     end
 
     test ":on_success should be a valid action" do

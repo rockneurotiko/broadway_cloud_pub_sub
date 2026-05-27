@@ -39,7 +39,7 @@ defmodule BroadwayCloudPubSub.Streaming.AcknowledgerTest do
     {:ok, stub_pid} = StubManager.start_link(self())
     ack_ref = make_ref()
 
-    config = %{on_success: :ack, on_failure: :noop}
+    config = %{on_success: :ack, on_failure: {:nack, 0}}
     :persistent_term.put(ack_ref, {stub_pid, config})
 
     on_exit(fn -> :persistent_term.erase(ack_ref) end)
@@ -73,7 +73,7 @@ defmodule BroadwayCloudPubSub.Streaming.AcknowledgerTest do
 
     test "merges on_success into ack_data", %{ack_ref: ack_ref} do
       {:ok, data} = Acknowledger.configure(ack_ref, %{ack_id: "x"}, on_success: :noop)
-      assert data == %{ack_id: "x", on_success: :noop, on_failure: :noop}
+      assert data == %{ack_id: "x", on_success: :noop, on_failure: {:nack, 0}}
     end
 
     test "normalises :nack on_failure to {:nack, 0}", %{ack_ref: ack_ref} do
@@ -98,7 +98,8 @@ defmodule BroadwayCloudPubSub.Streaming.AcknowledgerTest do
       assert Enum.sort(ack_ids) == ["id-1", "id-2"]
     end
 
-    test "does not ack failed messages when on_failure is :noop (default)", %{ack_ref: ack_ref} do
+    test "does not ack failed messages when on_failure is :noop", %{ack_ref: ack_ref, stub_pid: stub_pid} do
+      :persistent_term.put(ack_ref, {stub_pid, %{on_success: :ack, on_failure: :noop}})
       success = [build_message("ok-1", ack_ref)]
       failure = [build_message("fail-1", ack_ref)]
 
@@ -107,6 +108,16 @@ defmodule BroadwayCloudPubSub.Streaming.AcknowledgerTest do
       assert_receive {:acknowledge, ["ok-1"]}
       refute_receive {:acknowledge, _}
       refute_receive {:modify_deadline, _, _}
+    end
+
+    test "nacks failed messages by default (on_failure: {:nack, 0})", %{ack_ref: ack_ref} do
+      success = [build_message("ok-1", ack_ref)]
+      failure = [build_message("fail-1", ack_ref)]
+
+      Acknowledger.ack(ack_ref, success, failure)
+
+      assert_receive {:acknowledge, ["ok-1"]}
+      assert_receive {:modify_deadline, ["fail-1"], 0}
     end
 
     test "does not send anything when on_success is :noop", %{
@@ -169,7 +180,7 @@ defmodule BroadwayCloudPubSub.Streaming.AcknowledgerTest do
 
     test "respects per-message on_failure override", %{ack_ref: ack_ref} do
       nack_msg = build_message("nack-id", ack_ref, %{on_failure: {:nack, 10}})
-      noop_msg = build_message("noop-id", ack_ref)
+      noop_msg = build_message("noop-id", ack_ref, %{on_failure: :noop})
 
       Acknowledger.ack(ack_ref, [], [nack_msg, noop_msg])
 

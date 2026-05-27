@@ -93,9 +93,9 @@ defmodule BroadwayCloudPubSub.Streaming.OptionsTest do
       assert opts[:on_success] == :ack
     end
 
-    test "on_failure defaults to :noop" do
+    test "on_failure defaults to {:nack, 0}" do
       {:ok, opts} = validate(subscription: "projects/p/subscriptions/s")
-      assert opts[:on_failure] == :noop
+      assert opts[:on_failure] == {:nack, 0}
     end
 
     test "accepts :ack" do
