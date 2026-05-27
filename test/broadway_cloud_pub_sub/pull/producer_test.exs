@@ -1,4 +1,4 @@
-defmodule BroadwayCloudPubSub.ProducerTest do
+defmodule BroadwayCloudPubSub.Pull.ProducerTest do
   use ExUnit.Case
 
   alias Broadway.Message
@@ -49,7 +49,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
   end
 
   defmodule FakeClient do
-    alias BroadwayCloudPubSub.Client
+    alias BroadwayCloudPubSub.Pull.Client
     alias Broadway.Acknowledger
 
     @behaviour Client
@@ -81,7 +81,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
   end
 
   defmodule FakePrepareToConnectClient do
-    alias BroadwayCloudPubSub.Client
+    alias BroadwayCloudPubSub.Pull.Client
 
     @behaviour Client
 
@@ -132,9 +132,9 @@ defmodule BroadwayCloudPubSub.ProducerTest do
     {:ok, pid} = start_broadway(message_server)
 
     try do
-      BroadwayCloudPubSub.Producer.prepare_for_start(Forwarder,
+      BroadwayCloudPubSub.Pull.Producer.prepare_for_start(Forwarder,
         producer: [
-          module: {BroadwayCloudPubSub.Producer, module_opts},
+          module: {BroadwayCloudPubSub.Pull.Producer, module_opts},
           concurrency: 1
         ],
         name: __MODULE__
@@ -182,7 +182,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
                _,
                [
                  producer: [
-                   module: {BroadwayCloudPubSub.Producer, producer_opts},
+                   module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                    concurrency: 1
                  ],
                  name: __MODULE__
@@ -201,7 +201,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
                assert {_,
                        [
                          producer: [
-                           module: {BroadwayCloudPubSub.Producer, producer_opts},
+                           module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                            concurrency: 1
                          ],
                          name: __MODULE__
@@ -218,7 +218,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -235,7 +235,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, result_module_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, result_module_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -251,7 +251,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, result_module_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, result_module_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -293,7 +293,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -304,7 +304,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
                )
 
       assert producer_opts[:token_generator] ==
-               {BroadwayCloudPubSub.Options, :generate_goth_token, [FakeAuth]}
+               {BroadwayCloudPubSub.Pull.Options, :generate_goth_token, [FakeAuth]}
     end
 
     test ":token_generator should be a tuple {Mod, Fun, Args}" do
@@ -313,7 +313,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -348,7 +348,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -377,7 +377,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -395,7 +395,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -412,7 +412,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -430,7 +430,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
         assert {_,
                 [
                   producer: [
-                    module: {BroadwayCloudPubSub.Producer, producer_opts},
+                    module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                     concurrency: 1
                   ],
                   name: __MODULE__
@@ -490,7 +490,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
         assert {_,
                 [
                   producer: [
-                    module: {BroadwayCloudPubSub.Producer, producer_opts},
+                    module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                     concurrency: 1
                   ],
                   name: __MODULE__
@@ -549,7 +549,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       assert {_,
               [
                 producer: [
-                  module: {BroadwayCloudPubSub.Producer, producer_opts},
+                  module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                   concurrency: 1
                 ],
                 name: __MODULE__
@@ -568,11 +568,11 @@ defmodule BroadwayCloudPubSub.ProducerTest do
     test "with :client PullClient returns a child_spec for starting a Finch pool" do
       assert {
                [
-                 {Finch, name: BroadwayCloudPubSub.ProducerTest.BroadwayCloudPubSub.PullClient}
+                 {Finch, name: BroadwayCloudPubSub.Pull.ProducerTest.BroadwayCloudPubSub.Pull.FinchClient}
                ],
                [
                  producer: [
-                   module: {BroadwayCloudPubSub.Producer, _producer_opts},
+                   module: {BroadwayCloudPubSub.Pull.Producer, _producer_opts},
                    concurrency: 1
                  ],
                  name: __MODULE__
@@ -589,7 +589,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
                [],
                [
                  producer: [
-                   module: {BroadwayCloudPubSub.Producer, producer_opts},
+                   module: {BroadwayCloudPubSub.Pull.Producer, producer_opts},
                    concurrency: 1
                  ],
                  name: __MODULE__
@@ -761,7 +761,7 @@ defmodule BroadwayCloudPubSub.ProducerTest do
       name: broadway_name,
       context: %{test_pid: self()},
       producer: [
-        module: {BroadwayCloudPubSub.Producer, Keyword.merge(producer_opts, opts)},
+        module: {BroadwayCloudPubSub.Pull.Producer, Keyword.merge(producer_opts, opts)},
         concurrency: 1
       ],
       processors: [

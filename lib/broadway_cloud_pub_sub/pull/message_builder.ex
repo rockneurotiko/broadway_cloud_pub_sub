@@ -1,4 +1,4 @@
-defmodule BroadwayCloudPubSub.MessageBuilder do
+defmodule BroadwayCloudPubSub.Pull.MessageBuilder do
   @moduledoc false
 
   # Shared message-building logic used by both the pull client and the

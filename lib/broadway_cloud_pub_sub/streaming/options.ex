@@ -349,7 +349,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
   @doc """
   Builds an MFArgs tuple for a token generator using Goth.
   """
-  defdelegate make_token_generator(opts), to: BroadwayCloudPubSub.Options
+  defdelegate make_token_generator(opts), to: BroadwayCloudPubSub.Pull.Options
 
   # --- Custom type validators ---
 

@@ -1,13 +1,13 @@
-defmodule BroadwayCloudPubSub.AcknowledgerTest do
+defmodule BroadwayCloudPubSub.Pull.AcknowledgerTest do
   use ExUnit.Case
   alias Broadway.Message
-  alias BroadwayCloudPubSub.Client
-  alias BroadwayCloudPubSub.Acknowledger
+  alias BroadwayCloudPubSub.Pull.Client
+  alias BroadwayCloudPubSub.Pull.Acknowledger
 
   defmodule CallerClient do
-    alias BroadwayCloudPubSub.Acknowledger
+    alias BroadwayCloudPubSub.Pull.Acknowledger
 
-    @behaviour Client
+    @behaviour BroadwayCloudPubSub.Pull.Client
 
     @impl Client
     def init(opts) do

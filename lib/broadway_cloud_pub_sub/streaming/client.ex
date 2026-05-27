@@ -49,7 +49,7 @@ defmodule BroadwayCloudPubSub.Streaming.Client do
   Invoked once during producer startup to normalize options into a `config` term.
 
   The `config` term is stored in state and forwarded as the last argument to all
-  subsequent callbacks, analogous to how `c:BroadwayCloudPubSub.Client.init/1`
+  subsequent callbacks, analogous to how `c:BroadwayCloudPubSub.Pull.Client.init/1`
   works for the pull producer.
   """
   @callback init(opts :: keyword()) :: {:ok, config()} | {:error, term()}

@@ -8,7 +8,7 @@ defmodule BroadwayCloudPubSub.Streaming.MessageDispatch do
   # no side effects (no send/2, no telemetry). StreamManager handles all side
   # effects based on the returned results.
 
-  alias BroadwayCloudPubSub.MessageBuilder
+  alias BroadwayCloudPubSub.Pull.MessageBuilder
   alias BroadwayCloudPubSub.Streaming.{Acknowledger, AckTimeDistribution}
 
   # --- Buffer and demand ---

@@ -1,10 +1,10 @@
-defmodule BroadwayCloudPubSub.Producer do
+defmodule BroadwayCloudPubSub.Pull.Producer do
   @moduledoc """
   A GenStage producer that continuously receives messages from a Google Cloud Pub/Sub
   topic and acknowledges them after being successfully processed.
 
-  By default this producer uses `BroadwayCloudPubSub.PullClient` to talk to Cloud
-  Pub/Sub, but you can provide your client by implementing the `BroadwayCloudPubSub.Client`
+  By default this producer uses `BroadwayCloudPubSub.Pull.FinchClient` to talk to Cloud
+  Pub/Sub, but you can provide your client by implementing the `BroadwayCloudPubSub.Pull.Client`
   behaviour.
 
   For a quick getting started on using Broadway with Cloud Pub/Sub, please see
@@ -16,7 +16,7 @@ defmodule BroadwayCloudPubSub.Producer do
   producers (regardless of the client implementation), all other options are specific to
   `BroadwayCloudPubSub.PullClient`, which is the default client.
 
-  #{NimbleOptions.docs(BroadwayCloudPubSub.Options.definition())}
+  #{NimbleOptions.docs(BroadwayCloudPubSub.Pull.Options.definition())}
 
   ### Custom token generator
 
@@ -43,8 +43,8 @@ defmodule BroadwayCloudPubSub.Producer do
   You can use the `:on_success` and `:on_failure` options to control how
   messages are acknowledged with the Pub/Sub system.
 
-  By default successful messages are acknowledged and failed messages are ignored.
-  You can set `:on_success` and `:on_failure` when starting this producer,
+  By default successful messages are acknowledged and failed messages are ignored
+  (`:noop`). You can set `:on_success` and `:on_failure` when starting this producer,
   or change them for each message through `Broadway.Message.configure_ack/2`.
 
   The following values are supported by both `:on_success` and `:on_failure`:
@@ -82,7 +82,7 @@ defmodule BroadwayCloudPubSub.Producer do
       Broadway.start_link(MyBroadway,
         name: MyBroadway,
         producer: [
-          module: {BroadwayCloudPubSub.Producer,
+          module: {BroadwayCloudPubSub.Pull.Producer,
             goth: MyApp.Goth,
             subscription: "projects/my-project/subscriptions/my_subscription"
           }
@@ -130,7 +130,7 @@ defmodule BroadwayCloudPubSub.Producer do
 
   use GenStage
   alias Broadway.Producer
-  alias BroadwayCloudPubSub.{Acknowledger, Options}
+  alias BroadwayCloudPubSub.Pull.{Acknowledger, Options}
 
   @behaviour Producer
 
