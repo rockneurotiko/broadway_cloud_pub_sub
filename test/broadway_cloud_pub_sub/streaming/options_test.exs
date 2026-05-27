@@ -473,7 +473,7 @@ end
 defmodule BroadwayCloudPubSub.Streaming.ProducerPrepareForStartTest do
   use ExUnit.Case, async: true
 
-  alias BroadwayCloudPubSub.Streaming.Producer
+  alias BroadwayCloudPubSub.Producer
 
   # Minimal broadway_opts that satisfies prepare_for_start/2.
   defp broadway_opts(producer_opts \\ []) do

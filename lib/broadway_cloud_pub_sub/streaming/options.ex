@@ -1,7 +1,5 @@
 defmodule BroadwayCloudPubSub.Streaming.Options do
-  @moduledoc """
-  Options for `BroadwayCloudPubSub.Streaming.Producer`.
-  """
+  @moduledoc false
 
   @default_grpc_endpoint "pubsub.googleapis.com:443"
   @default_max_outstanding_messages 1_000

@@ -1,6 +1,6 @@
 defmodule BroadwayCloudPubSub.Streaming.GrpcClient do
   @moduledoc """
-  The default gRPC client for `BroadwayCloudPubSub.Streaming.Producer`.
+  The default gRPC client for `BroadwayCloudPubSub.Producer`.
 
   Implements `BroadwayCloudPubSub.Streaming.Client` using the `grpc` library
   with the `Google.Pubsub.V1.Subscriber.Stub` generated stub.

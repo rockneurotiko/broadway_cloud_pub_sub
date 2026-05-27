@@ -4,7 +4,7 @@ defmodule BroadwayCloudPubSub.Streaming.Client do
 
   The default implementation is `BroadwayCloudPubSub.Streaming.GrpcClient`.
   Provide a custom module via the `:grpc_client` option on
-  `BroadwayCloudPubSub.Streaming.Producer` for testing or alternate transports.
+  `BroadwayCloudPubSub.Producer` for testing or alternate transports.
 
   ## Implementing a custom client
 
@@ -28,7 +28,7 @@ defmodule BroadwayCloudPubSub.Streaming.Client do
 
   Then configure the producer:
 
-      {BroadwayCloudPubSub.Streaming.Producer,
+      {BroadwayCloudPubSub.Producer,
        grpc_client: MyApp.FakeGrpcClient,
        subscription: "projects/my-project/subscriptions/my-sub",
        ...}

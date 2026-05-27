@@ -2,7 +2,7 @@ defmodule BroadwayCloudPubSub.Streaming.UnaryAckSupervisor do
   @moduledoc false
 
   # Supervisor that owns the AckBatcher and UnaryRpcClient for a single Broadway
-  # Streaming.Producer pipeline.
+  # BroadwayCloudPubSub.Producer pipeline.
   #
   # Uses :one_for_one so each child restarts independently. AckBatcher accumulates
   # pending ack_ids in its state; restarting it when UnaryRpcClient crashes would

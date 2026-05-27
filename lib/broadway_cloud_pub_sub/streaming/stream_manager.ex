@@ -139,7 +139,7 @@ defmodule BroadwayCloudPubSub.Streaming.StreamManager do
   StreamManager accumulates it into `pending_demand` and flushes up to the
   new total from the message buffer.
 
-  Called by `Streaming.Producer.handle_demand/2`.
+  Called by `BroadwayCloudPubSub.Producer.handle_demand/2`.
   """
   @spec notify_demand(pid(), non_neg_integer()) :: :ok
   def notify_demand(pid, amount) when is_integer(amount) and amount >= 0 do

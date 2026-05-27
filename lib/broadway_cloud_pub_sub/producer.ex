@@ -1,4 +1,4 @@
-defmodule BroadwayCloudPubSub.Streaming.Producer do
+defmodule BroadwayCloudPubSub.Producer do
   @moduledoc """
   A Broadway producer that uses the gRPC StreamingPull API to receive
   messages from a Google Cloud Pub/Sub subscription.
@@ -7,7 +7,7 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   This producer opens a persistent bidirectional gRPC stream to the Pub/Sub
   service and receives messages as the server pushes them. This is more
-  efficient than the HTTP pull approach (`BroadwayCloudPubSub.Producer`) for
+  efficient than the HTTP pull approach (`BroadwayCloudPubSub.Pull.Producer`) for
   workloads that require low latency or high throughput.
 
   Each producer process (N = `producer: [concurrency: N]`) starts and links
@@ -34,7 +34,7 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
         name: MyPipeline,
         producer: [
           module:
-            {BroadwayCloudPubSub.Streaming.Producer,
+            {BroadwayCloudPubSub.Producer,
              goth: MyApp.Goth,
              subscription: "projects/my-project/subscriptions/my-subscription",
              max_outstanding_messages: 1000}
@@ -326,13 +326,13 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
   To use with the local Pub/Sub emulator:
 
-      {BroadwayCloudPubSub.Streaming.Producer,
+      {BroadwayCloudPubSub.Producer,
        subscription: "projects/my-project/subscriptions/my-subscription",
        grpc_endpoint: "localhost:8085",
        use_ssl: false,
        token_generator: {MyApp, :emulator_token, []}}
 
-  ## Differences from `BroadwayCloudPubSub.Producer`
+  ## Differences from `BroadwayCloudPubSub.Pull.Producer`
 
     * **Push-based**: Messages arrive via a persistent gRPC stream rather than
       being fetched on demand via HTTP pull requests.
@@ -525,13 +525,13 @@ defmodule BroadwayCloudPubSub.Streaming.Producer do
 
         if min > max do
           raise ArgumentError,
-                "invalid Streaming.Producer options: :backoff_min (#{min}) must be <= :backoff_max (#{max})"
+                "invalid BroadwayCloudPubSub.Producer options: :backoff_min (#{min}) must be <= :backoff_max (#{max})"
         end
 
         validated
 
       {:error, err} ->
-        raise ArgumentError, "invalid Streaming.Producer options: #{Exception.message(err)}"
+        raise ArgumentError, "invalid BroadwayCloudPubSub.Producer options: #{Exception.message(err)}"
     end
   end
 
