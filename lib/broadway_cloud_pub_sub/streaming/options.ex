@@ -297,12 +297,18 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       """
     ],
     grpc_client: [
-      type: :atom,
+      type: {:custom, __MODULE__, :type_grpc_client, [[]]},
       default: BroadwayCloudPubSub.Streaming.GrpcClient,
       doc: """
       The module implementing the `BroadwayCloudPubSub.Streaming.Client` behaviour.
       Defaults to `BroadwayCloudPubSub.Streaming.GrpcClient`, which uses the
       `grpc` library to communicate with Google Cloud Pub/Sub.
+
+      Accepts either a bare module or a `{module, opts}` tuple. When a tuple is
+      given, `opts` are merged into the producer options and passed to
+      `c:BroadwayCloudPubSub.Streaming.Client.init/1`:
+
+          grpc_client: {MyGrpcClient, channel_opts: [transport_opts: []]}
 
       Swap this for testing or custom gRPC transports.
       """
@@ -400,6 +406,17 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
     {:error,
      "expected :#{name} to be :nack, :noop, or {:nack, integer} where " <>
        "integer is between 0 and 600, got: #{inspect(value)}"}
+  end
+
+  def type_grpc_client(mod, _opts) when is_atom(mod) and not is_nil(mod), do: {:ok, mod}
+
+  def type_grpc_client({mod, inner_opts}, _opts)
+      when is_atom(mod) and not is_nil(mod) and is_list(inner_opts),
+      do: {:ok, {mod, inner_opts}}
+
+  def type_grpc_client(value, _opts) do
+    {:error,
+     "expected :grpc_client to be a module or {module, opts} tuple, got: #{inspect(value)}"}
   end
 
   def type_adapter(:gun, _), do: {:ok, GRPC.Client.Adapters.Gun}

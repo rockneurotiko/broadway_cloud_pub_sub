@@ -523,5 +523,43 @@ defmodule BroadwayCloudPubSub.Streaming.ProducerPrepareForStartTest do
       [sup_spec] = specs
       assert sup_spec.type == :supervisor
     end
+
+    test ":grpc_client accepts a bare module" do
+      {_specs, updated_opts} = Producer.prepare_for_start(Producer, broadway_opts())
+      {_module, producer_opts} = updated_opts[:producer][:module]
+
+      # Default GrpcClient stored as bare module
+      assert producer_opts[:grpc_client] == BroadwayCloudPubSub.Streaming.GrpcClient
+    end
+
+    test ":grpc_client accepts {Module, inner_opts} and merges inner_opts into producer opts" do
+      defmodule FakeGrpcClient do
+        @behaviour BroadwayCloudPubSub.Streaming.Client
+
+        @impl true
+        def init(opts), do: {:ok, Map.new(opts)}
+
+        @impl true
+        def connect(_opts), do: {:ok, :fake_channel}
+
+        @impl true
+        def recv_messages(_channel, _opts), do: []
+
+        @impl true
+        def acknowledge(_channel, _ack_ids, _opts), do: :ok
+
+        @impl true
+        def modify_ack_deadline(_channel, _ack_ids, _deadline, _opts), do: :ok
+      end
+
+      opts = broadway_opts(grpc_client: {FakeGrpcClient, custom_opt: :hello})
+      {_specs, updated_opts} = Producer.prepare_for_start(Producer, opts)
+      {_module, producer_opts} = updated_opts[:producer][:module]
+
+      # Module extracted from tuple
+      assert producer_opts[:grpc_client] == FakeGrpcClient
+      # Inner opts merged into producer opts
+      assert producer_opts[:custom_opt] == :hello
+    end
   end
 end

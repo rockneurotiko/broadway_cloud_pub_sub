@@ -374,8 +374,16 @@ defmodule BroadwayCloudPubSub.Producer do
 
     broadway_name = opts[:broadway_name]
 
+    # Normalise :grpc_client — accept Module or {Module, inner_opts}.
+    # When a tuple is given, merge the inner opts into the producer opts so
+    # that grpc_client.init/1 and all downstream components see them.
+    {grpc_client, opts} =
+      case opts[:grpc_client] do
+        {mod, inner_opts} -> {mod, Keyword.merge(opts, inner_opts) |> Keyword.put(:grpc_client, mod)}
+        mod -> {mod, opts}
+      end
+
     # Add grpc_client_config to be used by stream manager and unary
-    grpc_client = opts[:grpc_client]
     {:ok, client_config} = grpc_client.init(opts)
 
     opts = Keyword.put(opts, :grpc_client_config, client_config)
