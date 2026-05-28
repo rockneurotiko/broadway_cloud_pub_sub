@@ -6,44 +6,60 @@ A Google Cloud Pub/Sub connector for [Broadway](https://github.com/dashbitco/bro
 
 Documentation can be found at [https://hexdocs.pm/broadway_cloud_pub_sub](https://hexdocs.pm/broadway_cloud_pub_sub).
 
-This project provides:
+## What's in the box
 
-* `BroadwayCloudPubSub.Producer` - A GenStage producer that continuously receives messages from a Pub/Sub subscription and acknowledges them after being successfully processed.
-* `BroadwayCloudPubSub.Streaming.Producer` - A GenStage producer that uses the gRPC StreamingPull API for low-latency, push-based message delivery.
-* `BroadwayCloudPubSub.Client` - A generic behaviour to implement Pub/Sub clients.
-* `BroadwayCloudPubSub.PullClient` - Default REST client used by `BroadwayCloudPubSub.Producer`.
+* `BroadwayCloudPubSub.Producer`: Broadway producer using the gRPC
+  [StreamingPull][gcp-streamingpull] API. Messages are pushed by the server over
+  a persistent bidirectional stream, giving low latency and high throughput with
+  automatic lease extension and server-side flow control. **This is the
+  recommended producer**, in line with Google's own [guidance][gcp-streamingpull]
+  that StreamingPull is what their first-party client libraries use "where
+  possible".
+* `BroadwayCloudPubSub.Pull.Producer`: Broadway producer using the unary HTTP
+  [Pull][gcp-pull-api] API. Retained for environments where gRPC is unavailable
+  or undesired, and for the cases Google lists as Pull-only: when you need
+  strict control over the number of messages pulled per request, tight control
+  over client memory and CPU, or when your subscriber acts as a proxy to
+  another pull-oriented system.
+* `BroadwayCloudPubSub.Streaming.Client`: Behaviour for custom gRPC client implementations.
+* `BroadwayCloudPubSub.Pull.Client`: Behaviour for custom HTTP pull client implementations.
+
+[gcp-streamingpull]: https://cloud.google.com/pubsub/docs/pull#streamingpull_api
+[gcp-pull-api]: https://cloud.google.com/pubsub/docs/pull#pull_api
 
 ## Installation
 
-Add `:broadway_cloud_pub_sub` to the list of dependencies in `mix.exs`:
+Add `:broadway_cloud_pub_sub` to your dependencies, along with an HTTP/2 adapter
+for `:grpc`:
 
 ```elixir
 def deps do
   [
-    {:broadway_cloud_pub_sub, "~> 1.0"},
-    {:goth, "~> 1.3"}
-  ]
-end
-```
-
-> Note the [goth](https://hexdocs.pm/goth) package, which handles Google Authentication, is required for the default token generator.
-
-If you are using `BroadwayCloudPubSub.Streaming.Producer`, also add the gRPC dependencies:
-
-```elixir
-def deps do
-  [
-    {:broadway_cloud_pub_sub, "~> 0.10.0"},
+    {:broadway_cloud_pub_sub, "~> 2.0"},
     {:goth, "~> 1.3"},
     {:grpc, "~> 1.0"},
-    {:protobuf, "~> 0.12"}
+    {:protobuf, "~> 0.12"},
+    # Pick one HTTP/2 adapter:
+    {:gun, "~> 2.0"},
+    # or
+    # {:mint, "~> 1.5"},
+    # {:castore, "~> 1.0"}
   ]
 end
 ```
 
-## Usage
+> The [goth](https://hexdocs.pm/goth) package handles Google Authentication and
+> is required for the default token generator.
+>
+> The `grpc` and `protobuf` packages are required by
+> `BroadwayCloudPubSub.Producer`. You must pick one HTTP/2 adapter for the gRPC
+> connection and add it to your `mix.exs`: either `:gun`, or `:mint` together
+> with `:castore`.
+>
+> If you only use `BroadwayCloudPubSub.Pull.Producer` you may omit `:grpc`,
+> `:protobuf`, and the adapter packages.
 
-Configure Broadway with one or more producers using `BroadwayCloudPubSub.Producer`:
+## Usage
 
 ```elixir
 Broadway.start_link(MyBroadway,
@@ -51,56 +67,58 @@ Broadway.start_link(MyBroadway,
   producer: [
     module: {BroadwayCloudPubSub.Producer,
       goth: MyGoth,
-      subscription: "projects/my-project/subscriptions/my-subscription"
-    }
-  ]
-)
-```
-
-## Streaming Usage
-
-For lower latency and higher throughput workloads, use `BroadwayCloudPubSub.Streaming.Producer`.
-It opens a persistent bidirectional gRPC stream to Pub/Sub and receives messages as the server
-pushes them, rather than polling via HTTP.
-
-```elixir
-Broadway.start_link(MyBroadway,
-  name: MyBroadway,
-  producer: [
-    module: {BroadwayCloudPubSub.Streaming.Producer,
-      goth: MyGoth,
       subscription: "projects/my-project/subscriptions/my-subscription",
       max_outstanding_messages: 1000
     }
-  ]
+  ],
+  processors: [default: [concurrency: 10]]
 )
 ```
 
-### gRPC adapter
+See `BroadwayCloudPubSub.Producer` for the full option reference, including flow
+control, reconnection backoff, graceful shutdown, and telemetry.
 
-The streaming producer supports two HTTP/2 adapters, both provided by the `grpc` dependency:
+### HTTP/2 adapter
 
-- `:gun` (default) — Uses the [Gun](https://github.com/ninenines/gun) HTTP/2 client. This is the
-  traditional adapter and works out of the box with the standard `grpc` dependency.
-- `:mint` — Uses the [Mint](https://github.com/elixir-mint/mint) HTTP/2 client. Mint may be
-  preferable in environments where Gun is not available or not desired.
+The producer supports two adapters. Both are optional dependencies of `:grpc`,
+so you select one by adding it to your application's `mix.exs` (see
+[Installation](#installation)).
+
+- `:gun` (default): [Gun](https://github.com/ninenines/gun) HTTP/2 client.
+  Add `{:gun, "~> 2.0"}` to your deps.
+- `:mint`: [Mint](https://github.com/elixir-mint/mint) HTTP/2 client.
+  Add `{:mint, "~> 1.5"}` and `{:castore, "~> 1.0"}` to your deps.
+
+Then select the adapter in your producer config:
+
+```elixir
+{BroadwayCloudPubSub.Producer,
+ goth: MyGoth,
+ subscription: "projects/my-project/subscriptions/my-subscription",
+ adapter: :mint}
+```
+
+### Using the HTTP pull producer
+
+If gRPC is not available in your environment or you prefer to use the HTTP pull method, use `BroadwayCloudPubSub.Pull.Producer`:
 
 ```elixir
 Broadway.start_link(MyBroadway,
   name: MyBroadway,
   producer: [
-    module: {BroadwayCloudPubSub.Streaming.Producer,
+    module: {BroadwayCloudPubSub.Pull.Producer,
       goth: MyGoth,
-      subscription: "projects/my-project/subscriptions/my-subscription",
-      adapter: :mint
+      subscription: "projects/my-project/subscriptions/my-subscription"
     }
-  ]
+  ],
+  processors: [default: [concurrency: 10]]
 )
 ```
 
-See `BroadwayCloudPubSub.Streaming.Producer` for the full list of configuration options,
-including flow control (`max_outstanding_messages`, `max_outstanding_bytes`), reconnection
-backoff, and shutdown behaviour.
+### Upgrading from 1.x
+
+See the [2.0 upgrade guide](docs/upgrade_to_2.0.md) for the full list of breaking
+changes and step-by-step migration instructions from pull producer to gRPC streaming producer.
 
 ## License
 

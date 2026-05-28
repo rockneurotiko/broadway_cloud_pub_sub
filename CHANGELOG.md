@@ -7,42 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [2.0.0-rc.0] - unreleased
+
+2.0 introduces a new default producer based on the gRPC StreamingPull API.
+The previous HTTP pull producer is still fully supported under
+`BroadwayCloudPubSub.Pull.Producer`. See the
+[2.0 upgrade guide](docs/upgrade_to_2.0.md) for step-by-step migration
+instructions.
+
 ### Added
 
-- `BroadwayCloudPubSub.Streaming.Producer` — a new Broadway producer that uses the
-  gRPC StreamingPull API for low-latency, push-based message delivery instead of
-  HTTP pull requests
+- **`BroadwayCloudPubSub.Producer`**: a new Broadway producer that uses the
+  gRPC StreamingPull API for low-latency, push-based message delivery. This is
+  the recommended producer going forward.
 
-  - Server-side flow control via `:max_outstanding_messages` and `:max_outstanding_bytes`
-
-  - Automatic lease extension with adaptive p99 ack deadlines to prevent premature
-    message redelivery
-
-  - Batched ack/nack via a separate unary gRPC connection, independent of the streaming
-    connection
-
-  - Exactly-once delivery support, auto-detected from subscription properties at runtime
-
-  - Message ordering support via the `:enable_message_ordering` option
-
+  - Persistent bidirectional gRPC stream; messages are pushed by the server
+    rather than fetched on demand
+  - Server-side flow control via `:max_outstanding_messages` and
+    `:max_outstanding_bytes`
+  - Automatic lease extension with adaptive p99 ack deadlines, preventing
+    premature redelivery without manual `ackDeadlineSeconds` tuning
+  - Batched ack/nack via a separate unary gRPC connection, independent of the
+    streaming connection
+  - Exactly-once delivery support, auto-detected from subscription properties
+    at runtime
+  - Message ordering via `:enable_message_ordering`
   - Graceful shutdown with configurable drain timeout (`:drain_timeout_ms`)
+  - Comprehensive telemetry: stream lifecycle, ack batching, and gRPC spans
+  - Gun and Mint HTTP/2 adapters via the `:adapter` option
+  - Pub/Sub emulator support via `:grpc_endpoint` and `:use_ssl`
 
-  - Telemetry events for stream lifecycle, ack batching, and gRPC spans
+- **`BroadwayCloudPubSub.Streaming.Client`**: behaviour for custom gRPC client
+  implementations, analogous to `BroadwayCloudPubSub.Pull.Client` on the pull
+  side.
 
-  - Support for both Gun and Mint HTTP/2 adapters via the `:adapter` option
-
-  - Pub/Sub emulator support via `:grpc_endpoint` and `:use_ssl` options
-
-  - `BroadwayCloudPubSub.Streaming.Client` — behaviour for custom gRPC client
-    implementations
-
-  - `BroadwayCloudPubSub.Streaming.GrpcClient` — default gRPC client using the
-  `grpc` library
+- **`BroadwayCloudPubSub.Streaming.GrpcClient`**: default gRPC client
+  implementation using the `grpc` library.
 
 ### Changed
 
-- Bump minimum elixir to 1.15
-- Modernize github actions
+- Modernize GitHub Actions CI.
+
+### Breaking changes
+
+- Bump minimum Elixir to 1.15.
+
+- **`BroadwayCloudPubSub.Producer` is now the gRPC streaming producer.** The
+  1.x HTTP pull producer has moved to `BroadwayCloudPubSub.Pull.Producer`.
+  Update the module name in your pipeline to keep the pull behaviour:
+
+  ```elixir
+  # 1.x
+  {BroadwayCloudPubSub.Producer, goth: MyApp.Goth, subscription: "..."}
+
+  # 2.0, keep pull
+  {BroadwayCloudPubSub.Pull.Producer, goth: MyApp.Goth, subscription: "..."}
+
+  # 2.0, switch to streaming (recommended)
+  {BroadwayCloudPubSub.Producer, goth: MyApp.Goth, subscription: "...",
+   max_outstanding_messages: 1000}
+  ```
+
+- **`BroadwayCloudPubSub.PullClient` renamed to
+  `BroadwayCloudPubSub.Pull.FinchClient`.** Only affects you if you referenced
+  it directly
+
+- **`BroadwayCloudPubSub.Client` behaviour renamed to
+  `BroadwayCloudPubSub.Pull.Client`.** Only affects you if you implemented a
+  custom HTTP pull client to override the `:client` option..
+
+- **`on_failure` default changed from `:noop` to `{:nack, 0}`** in both
+  producers. Failed messages are now immediately made available for redelivery,
+  matching the behaviour of the official Google Cloud Pub/Sub client libraries.
+  Set `on_failure: :noop` explicitly to preserve the 1.x behaviour.
+
 
 ## [1.0.0] - 2026-05-26
 

@@ -1,7 +1,7 @@
 defmodule BroadwayCloudPubSub.MixProject do
   use Mix.Project
 
-  @version "1.0.0"
+  @version "2.0.0-rc.0"
   @description "A Google Cloud Pub/Sub connector for Broadway"
   @repo_url "https://github.com/dashbitco/broadway_cloud_pub_sub"
 
@@ -54,7 +54,8 @@ defmodule BroadwayCloudPubSub.MixProject do
       source_url: @repo_url,
       extras: [
         "README.md",
-        "CHANGELOG.md"
+        "CHANGELOG.md",
+        "docs/upgrade_to_2.0.md"
       ],
       groups_for_modules: [
         Pull: [
