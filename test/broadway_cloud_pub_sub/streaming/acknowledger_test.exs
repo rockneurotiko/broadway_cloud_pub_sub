@@ -98,7 +98,10 @@ defmodule BroadwayCloudPubSub.Streaming.AcknowledgerTest do
       assert Enum.sort(ack_ids) == ["id-1", "id-2"]
     end
 
-    test "does not ack failed messages when on_failure is :noop", %{ack_ref: ack_ref, stub_pid: stub_pid} do
+    test "does not ack failed messages when on_failure is :noop", %{
+      ack_ref: ack_ref,
+      stub_pid: stub_pid
+    } do
       :persistent_term.put(ack_ref, {stub_pid, %{on_success: :ack, on_failure: :noop}})
       success = [build_message("ok-1", ack_ref)]
       failure = [build_message("fail-1", ack_ref)]

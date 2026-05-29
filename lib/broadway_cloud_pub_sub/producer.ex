@@ -400,8 +400,11 @@ defmodule BroadwayCloudPubSub.Producer do
     # that grpc_client.init/1 and all downstream components see them.
     {grpc_client, opts} =
       case opts[:grpc_client] do
-        {mod, inner_opts} -> {mod, Keyword.merge(opts, inner_opts) |> Keyword.put(:grpc_client, mod)}
-        mod -> {mod, opts}
+        {mod, inner_opts} ->
+          {mod, Keyword.merge(opts, inner_opts) |> Keyword.put(:grpc_client, mod)}
+
+        mod ->
+          {mod, opts}
       end
 
     # Add grpc_client_config to be used by stream manager and unary
@@ -560,7 +563,8 @@ defmodule BroadwayCloudPubSub.Producer do
         validated
 
       {:error, err} ->
-        raise ArgumentError, "invalid BroadwayCloudPubSub.Producer options: #{Exception.message(err)}"
+        raise ArgumentError,
+              "invalid BroadwayCloudPubSub.Producer options: #{Exception.message(err)}"
     end
   end
 

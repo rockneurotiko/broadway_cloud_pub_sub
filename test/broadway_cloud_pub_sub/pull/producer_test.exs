@@ -568,7 +568,8 @@ defmodule BroadwayCloudPubSub.Pull.ProducerTest do
     test "with :client PullClient returns a child_spec for starting a Finch pool" do
       assert {
                [
-                 {Finch, name: BroadwayCloudPubSub.Pull.ProducerTest.BroadwayCloudPubSub.Pull.FinchClient}
+                 {Finch,
+                  name: BroadwayCloudPubSub.Pull.ProducerTest.BroadwayCloudPubSub.Pull.FinchClient}
                ],
                [
                  producer: [
