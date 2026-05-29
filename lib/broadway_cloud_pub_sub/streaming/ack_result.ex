@@ -8,7 +8,7 @@ defmodule BroadwayCloudPubSub.Streaming.AckResult do
   # operation resolves to an AckResult describing whether the operation succeeded
   # or failed and why.
   #
-  # This matches Go's AckResult type in pubsub/message.go:
+  # This matches the AckResult type pattern used in official client libraries:
   #
   #   type AckResult struct {
   #     ready  chan struct{}

@@ -1,4 +1,4 @@
-# Upgrading to broadway_cloud_pub_sub 2.0
+# Upgrading to 2.0
 
 2.0 introduces a new default producer built on the gRPC StreamingPull API. The
 previous HTTP pull producer is still fully supported, but has moved to its own
@@ -8,11 +8,10 @@ sub-namespace as a fallback for environments where gRPC is unavailable.
 
 | # | What changed | Migration action |
 |---|---|---|
-| 1 | `BroadwayCloudPubSub.Producer` is now the **streaming** producer | Switch to streaming, or rename to `Pull.Producer` to keep pull |
-| 2 | Old pull producer moved to `BroadwayCloudPubSub.Pull.Producer` | Rename the module in your pipeline |
-| 3 | `BroadwayCloudPubSub.PullClient` → `BroadwayCloudPubSub.Pull.FinchClient` | Rename if referenced directly |
-| 4 | `BroadwayCloudPubSub.Client` behaviour → `BroadwayCloudPubSub.Pull.Client` | Rename if you implemented a custom pull client |
-| 5 | `on_failure` default: `:noop` → `{:nack, 0}` | Set `on_failure: :noop` explicitly to keep old behaviour |
+| [1](#1-new-default-producer) | `BroadwayCloudPubSub.Producer` is now the **streaming** producer | Switch to streaming, or rename to `Pull.Producer` to keep pull |
+| [2](#2-broadwaycloudpubsubpullclient-renamed) | `BroadwayCloudPubSub.PullClient` → `BroadwayCloudPubSub.Pull.FinchClient` | Rename if referenced directly |
+| [3](#3-broadwaycloudpubsubclient-behaviour-renamed) | `BroadwayCloudPubSub.Client` behaviour → `BroadwayCloudPubSub.Pull.Client` | Rename if you implemented a custom pull client |
+| [4](#4-on_failure-default-changed-noop--nack-0) | `on_failure` default: `:noop` → `{:nack, 0}` | Set `on_failure: :noop` explicitly to keep old behaviour |
 
 ---
 
@@ -114,7 +113,7 @@ These options have the same name and semantics in the streaming producer:
 | `:goth` | Same. |
 | `:token_generator` | Same MFA tuple interface. |
 | `:on_success` | Same values (`:ack`, `:noop`, `{:nack, seconds}`). |
-| `:on_failure` | Same values. Default changed to `{:nack, 0}` (see breaking change #5). |
+| `:on_failure` | Same values. Default changed to `{:nack, 0}` (see [breaking change #4](#4-on_failure-default-changed-noop--nack-0)). |
 
 #### Options that have a replacement
 

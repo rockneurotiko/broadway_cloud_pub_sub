@@ -49,7 +49,12 @@ defmodule BroadwayCloudPubSub.MixProject do
   defp docs do
     [
       main: "BroadwayCloudPubSub.Producer",
-      nest_modules_by_prefix: [BroadwayCloudPubSub],
+      nest_modules_by_prefix: [
+        BroadwayCloudPubSub,
+        BroadwayCloudPubSub.Streaming,
+        BroadwayCloudPubSub.Pull,
+        Google.Pubsub.V1
+      ],
       source_ref: "v#{@version}",
       source_url: @repo_url,
       extras: [
@@ -58,15 +63,18 @@ defmodule BroadwayCloudPubSub.MixProject do
         "docs/upgrade_to_2.0.md"
       ],
       groups_for_modules: [
+        Streaming: [
+          BroadwayCloudPubSub.Producer,
+          BroadwayCloudPubSub.Streaming.Client,
+          BroadwayCloudPubSub.Streaming.GrpcClient
+        ],
         Pull: [
           BroadwayCloudPubSub.Pull.Producer,
           BroadwayCloudPubSub.Pull.Client,
           BroadwayCloudPubSub.Pull.FinchClient
         ],
-        Streaming: [
-          BroadwayCloudPubSub.Producer,
-          BroadwayCloudPubSub.Streaming.Client,
-          BroadwayCloudPubSub.Streaming.GrpcClient
+        "Protobuf (generated)": [
+          ~r"Google.Pubsub.V1."
         ]
       ]
     ]

@@ -5,7 +5,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
   @default_max_outstanding_messages 1_000
   @default_max_outstanding_bytes 100 * 1024 * 1024
   @default_stream_ack_deadline_seconds 60
-  # 60 minutes — matches Go's MaxExtension default.
+  # 60 minutes, matches the official client library default.
   @default_max_extension_ms 60 * 60 * 1_000
   # gax defaults: https://github.com/googleapis/gax-go/blob/main/v2/call_option.go
   @default_backoff_min 100
@@ -18,6 +18,8 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
     # Handled by Broadway.
     broadway: [type: :any, doc: false],
     broadway_name: [type: :atom, doc: false],
+
+    # -- Connection --
     subscription: [
       type: {:custom, __MODULE__, :type_non_empty_string, [[{:name, :subscription}]]},
       required: true,
@@ -26,94 +28,6 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       For example, if your project is `"my-project"` and your
       subscription is `"my-subscription"`, the full name is
       `"projects/my-project/subscriptions/my-subscription"`.
-      """
-    ],
-    max_outstanding_messages: [
-      type: :pos_integer,
-      default: @default_max_outstanding_messages,
-      doc: """
-      The maximum number of outstanding messages (delivered but not yet
-      acknowledged) that the server will push. Acts as the primary flow
-      control mechanism. Analogous to AMQP `prefetch_count`.
-      """
-    ],
-    max_outstanding_bytes: [
-      type: :pos_integer,
-      default: @default_max_outstanding_bytes,
-      doc: """
-      The maximum total size in bytes of outstanding messages. The server
-      will not push more messages if the total byte size of outstanding
-      messages exceeds this limit. Defaults to 100 MiB.
-      """
-    ],
-    stream_ack_deadline_seconds: [
-      type:
-        {:custom, __MODULE__, :type_integer_in_range,
-         [[{:name, :stream_ack_deadline_seconds}, {:min, 10}, {:max, 600}]]},
-      default: @default_stream_ack_deadline_seconds,
-      doc: """
-      The number of seconds the server will wait before re-delivering an
-      unacknowledged message. Must be between 10 and 600. Defaults to 60.
-      The producer will extend leases automatically before this deadline.
-      """
-    ],
-    max_extension_ms: [
-      type: :pos_integer,
-      default: @default_max_extension_ms,
-      doc: """
-      The maximum total time in milliseconds that a message's ack deadline will
-      be extended from the moment of initial receipt. After this duration, the
-      message is dropped from lease management and the server will redeliver it.
-
-      This prevents a stuck consumer from holding messages indefinitely.
-      Matches the Go client's `MaxExtension` default of 60 minutes.
-      Defaults to #{div(@default_max_extension_ms, 60_000)} minutes.
-      """
-    ],
-    client_id: [
-      type: :string,
-      doc: """
-      An identifier that can be used to distinguish individual instances of
-      the producer. If not provided, a unique ID will be generated. Using
-      a stable `client_id` across reconnections enables the server to use
-      sticky assignment for ordered subscriptions.
-      """
-    ],
-    on_success: [
-      type: {:custom, __MODULE__, :type_ack_option, [[{:name, :on_success}]]},
-      default: :ack,
-      doc: """
-      Configures the acknowledgement behaviour for successfully processed
-      messages. Defaults to `:ack`.
-      """
-    ],
-    on_failure: [
-      type: {:custom, __MODULE__, :type_ack_option, [[{:name, :on_failure}]]},
-      default: {:nack, 0},
-      doc: """
-      Configures the acknowledgement behaviour for failed messages.
-      Defaults to `{:nack, 0}`, which makes failed messages immediately
-      available for redelivery. This matches the behaviour of the official
-      Google Cloud Pub/Sub client libraries.
-      """
-    ],
-    on_shutdown: [
-      type: {:custom, __MODULE__, :type_shutdown_option, [[{:name, :on_shutdown}]]},
-      default: {:nack, 5},
-      doc: """
-      Configures what happens to messages received but not yet processed
-      when the producer is shut down.
-
-        * `{:nack, seconds}` - Sends a `modifyAckDeadline` request with the
-          given `seconds` for all outstanding messages, making them available
-          for redelivery after that delay. The default `{:nack, 5}` provides
-          a small delay to avoid thundering herd on rolling deploys.
-        * `:nack` - Equivalent to `{:nack, 0}`. Immediately makes unprocessed
-          messages available for redelivery.
-        * `:noop` - Does nothing. Messages become available after their ack
-          deadline expires naturally.
-
-      Defaults to `{:nack, 5}`.
       """
     ],
     goth: [
@@ -131,58 +45,123 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       By default this will invoke `Goth.fetch/1` with the `:goth` option.
       """
     ],
-    backoff_type: [
-      type: {:in, [:rand_exp, :exp, :rand, :stop]},
-      default: :rand_exp,
+
+    # -- Flow control --
+    max_outstanding_messages: [
+      type: :pos_integer,
+      default: @default_max_outstanding_messages,
       doc: """
-      The backoff strategy used when reconnecting after a stream failure.
-
-        * `:rand_exp` - Randomized exponential backoff (default). Adds jitter
-          to prevent thundering herd after mass disconnects.
-        * `:exp` - Pure exponential backoff.
-        * `:rand` - Random value between `backoff_min` and `backoff_max`.
-        * `:stop` - Do not reconnect. The producer will crash after one failure.
-
+      The maximum number of outstanding messages (delivered but not yet
+      acknowledged) that the server will push. Acts as the primary flow
+      control mechanism. Analogous to AMQP `prefetch_count`.
       """
     ],
-    backoff_min: [
+    max_outstanding_bytes: [
       type: :pos_integer,
-      default: @default_backoff_min,
-      doc:
-        "Minimum reconnection backoff in milliseconds. Matches the gax default of 100ms. Defaults to 100."
-    ],
-    backoff_max: [
-      type: :pos_integer,
-      default: @default_backoff_max,
-      doc:
-        "Maximum reconnection backoff in milliseconds. Matches the gax default of 60s. Defaults to 60000."
-    ],
-    retry_deadline_ms: [
-      type: :pos_integer,
-      default: 60_000,
+      default: @default_max_outstanding_bytes,
       doc: """
-      Maximum total time in milliseconds to keep retrying a failed acknowledge or
-      modifyAckDeadline request before giving up and dropping the ack_ids.
+      The maximum total size in bytes of outstanding messages. The server
+      will not push more messages if the total byte size of outstanding
+      messages exceeds this limit.
+      """
+    ],
 
-      The default of 60,000ms (60 seconds) applies to standard delivery subscriptions.
-      When exactly-once delivery is detected from subscription properties, the library
-      automatically switches to 600,000ms (600 seconds) to match the Go client's
-      extended retry deadline for exactly-once acks. The configured value is restored
-      if exactly-once delivery is later disabled on the subscription.
-      """
-    ],
-    keepalive_interval_ms: [
-      type: :pos_integer,
-      default: @default_keepalive_interval_ms,
+    # -- Acknowledgement --
+    on_success: [
+      type: {:custom, __MODULE__, :type_ack_option, [[{:name, :on_success}]]},
+      default: :ack,
       doc: """
-      Interval in milliseconds at which HTTP/2 PING frames are sent on the gRPC
-      connection to keep it alive. This prevents Google Cloud's load balancer
-      from closing idle connections (which it does after roughly 20 seconds by
-      default). Matches the 30-second keepalive interval used by the official
-      Python and Go Pub/Sub client libraries. Only applies to the `:gun` adapter.
-      Defaults to 30000.
+      Configures the acknowledgement behaviour for successfully processed
+      messages.
       """
     ],
+    on_failure: [
+      type: {:custom, __MODULE__, :type_ack_option, [[{:name, :on_failure}]]},
+      default: {:nack, 0},
+      doc: """
+      Configures the acknowledgement behaviour for failed messages. The
+      default makes failed messages immediately available for redelivery.
+      """
+    ],
+    on_shutdown: [
+      type: {:custom, __MODULE__, :type_shutdown_option, [[{:name, :on_shutdown}]]},
+      default: {:nack, 5},
+      doc: """
+      Configures what happens to messages received but not yet processed
+      when the producer is shut down.
+
+          - `{:nack, seconds}` - Sends a `modifyAckDeadline` request with the
+          given `seconds` for all outstanding messages, making them available
+          for redelivery after that delay.
+          - `:nack` - Equivalent to `{:nack, 0}`. Immediately makes unprocessed
+          messages available for redelivery.
+          - `:noop` - Does nothing. Messages become available after their ack
+          deadline expires naturally.
+      """
+    ],
+
+    # -- Lease management --
+    stream_ack_deadline_seconds: [
+      type:
+        {:custom, __MODULE__, :type_integer_in_range,
+         [[{:name, :stream_ack_deadline_seconds}, {:min, 10}, {:max, 600}]]},
+      default: @default_stream_ack_deadline_seconds,
+      doc: """
+      The number of seconds the server will wait before re-delivering an
+      unacknowledged message. Must be between 10 and 600.
+      The producer will extend leases automatically before this deadline.
+      """
+    ],
+    max_extension_ms: [
+      type: :pos_integer,
+      default: @default_max_extension_ms,
+      doc: """
+      The maximum total time in milliseconds that a message's ack deadline will
+      be extended from the moment of initial receipt. After this duration, the
+      message is dropped from lease management and the server will redeliver it.
+      This prevents a stuck consumer from holding messages indefinitely.
+      """
+    ],
+
+    # -- Message ordering --
+    enable_message_ordering: [
+      type: :boolean,
+      default: false,
+      doc: """
+      When `true`, messages with the same `ordering_key` are routed to the
+      same Broadway processor and processed sequentially. This guarantees
+      in-order delivery for ordered subscriptions.
+
+          Ordering is enforced via Broadway's built-in `:partition_by` option,
+          which assigns messages with the same `orderingKey` metadata to the
+          same processor partition. The subscription itself must also have
+          message ordering enabled in Google Cloud Pub/Sub.
+
+          When `false` (default), messages are distributed across processors
+          without regard to ordering key, matching the unordered behaviour of a
+          standard Pub/Sub subscription.
+
+          Note: the server will also report whether the subscription has ordering
+          enabled in each `StreamingPullResponse.subscription_properties`. This
+          client-side option controls whether to enforce it in the Broadway
+          processing topology.
+      """
+    ],
+    client_id: [
+      type: :string,
+      doc: """
+      An identifier shared across all streaming connections opened by this
+      pipeline. When a stream disconnects and reconnects with the same
+      `client_id`, the server transfers any guarantees (e.g. ordered delivery
+      assignment) from the old stream to the new one. If not provided, a
+      random ID is generated once at pipeline startup. This is sufficient for
+      most use cases: the ID is stable across gRPC reconnections within the
+      same process lifetime, which is all the server requires. You only need
+      to set this explicitly if you want a human-readable value for debugging.
+      """
+    ],
+
+    # -- Ack batching --
     ack_batch_interval_ms: [
       type:
         {:custom, __MODULE__, :type_integer_in_range,
@@ -192,7 +171,7 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       Interval in milliseconds at which batched ack and modifyAckDeadline
       requests are flushed to the Pub/Sub service via unary RPCs.
       Lower values reduce end-to-end ack latency; higher values improve
-      batching efficiency. Defaults to 100.
+      batching efficiency.
       """
     ],
     ack_batch_max_size: [
@@ -204,24 +183,80 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       Maximum number of ack_ids to accumulate before triggering an
       immediate flush, regardless of the timer. Each unary RPC carries
       at most 2,500 ack_ids (the Google API limit), so values above 2,500
-      result in multiple RPCs per flush. Defaults to 2500.
+      result in multiple RPCs per flush.
       """
     ],
+    retry_deadline_ms: [
+      type: :pos_integer,
+      default: 60_000,
+      doc: """
+      Maximum total time in milliseconds to keep retrying a failed acknowledge or
+      modifyAckDeadline request before giving up and dropping the ack_ids.
+
+          The default of 60,000ms (60 seconds) applies to standard delivery subscriptions.
+          When exactly-once delivery is detected from subscription properties, the library
+          automatically switches to 600,000ms (600 seconds) for exactly-once acks. The
+          configured value is restored if exactly-once delivery is later disabled on the
+          subscription.
+      """
+    ],
+
+    # -- Reconnection --
+    backoff_type: [
+      type: {:in, [:rand_exp, :exp, :rand, :stop]},
+      default: :rand_exp,
+      doc: """
+      The backoff strategy used when reconnecting after a stream failure.
+
+          - `:rand_exp` - Randomized exponential backoff. Adds jitter to
+          prevent thundering herd after mass disconnects.
+          - `:exp` - Pure exponential backoff.
+          - `:rand` - Random value between `backoff_min` and `backoff_max`.
+          - `:stop` - Do not reconnect. The producer will crash after one
+          failure.
+      """
+    ],
+    backoff_min: [
+      type: :pos_integer,
+      default: @default_backoff_min,
+      doc: "Minimum reconnection backoff in milliseconds."
+    ],
+    backoff_max: [
+      type: :pos_integer,
+      default: @default_backoff_max,
+      doc: "Maximum reconnection backoff in milliseconds."
+    ],
+
+    # -- Shutdown --
+    drain_timeout_ms: [
+      type: :pos_integer,
+      default: 30_000,
+      doc: """
+      Maximum time in milliseconds to wait for in-flight messages to be
+      processed and acknowledged during graceful shutdown. After this timeout,
+      any remaining outstanding messages are nacked (per the `on_shutdown`
+      setting) and the connection is force-closed.
+
+          This drain phase waits for all outstanding messages to be acked before
+          calling `CloseSend` on the stream.
+      """
+    ],
+
+    # -- Transport --
     adapter: [
       type: {:custom, __MODULE__, :type_adapter, [[{:name, :adapter}]]},
       default: :gun,
       doc: """
       The gRPC HTTP/2 adapter to use for the streaming connection.
 
-        * `:gun` — Uses the Gun HTTP/2 client (default). Gun is well-tested
-          and is the traditional adapter for the Elixir gRPC library.
-        * `:mint` — Uses the Mint HTTP/2 client. Mint may be preferable in
-          deployment environments where Gun is not available or not desired.
-        * Any module — A custom module implementing the `GRPC.Client.Adapter`
-          behaviour. Useful for test adapters and alternative implementations.
+          - `:gun` - Uses the Gun HTTP/2 client. Well-tested and the
+          traditional adapter for the Elixir gRPC library.
+          - `:mint` - Uses the Mint HTTP/2 client. May be preferable where
+          Gun is not available.
+          - Any module implementing the `GRPC.Client.Adapter` behaviour.
 
-      Both built-in adapters are provided by the `grpc` dependency. The
-      adapter choice does not affect the public API or message semantics.
+          Both built-in adapters are provided by the `grpc` dependency. The
+          adapter choice does not affect the public API or message semantics.
       """
     ],
     grpc_endpoint: [
@@ -238,44 +273,16 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       doc: """
       Whether to use TLS when connecting to the gRPC endpoint. Set to `false`
       when connecting to the Pub/Sub emulator, which does not use TLS.
-      Defaults to `true`.
       """
     ],
-    drain_timeout_ms: [
+    keepalive_interval_ms: [
       type: :pos_integer,
-      default: 30_000,
+      default: @default_keepalive_interval_ms,
       doc: """
-      Maximum time in milliseconds to wait for in-flight messages to be
-      processed and acknowledged during graceful shutdown. After this timeout,
-      any remaining outstanding messages are nacked (per the `on_shutdown`
-      setting) and the connection is force-closed.
-
-      This drain phase mirrors Go's `iterator.stop()` which waits for the
-      `drained` channel to close (all outstanding messages acked) before
-      calling `CloseSend`. Defaults to 30 seconds.
-      """
-    ],
-    enable_message_ordering: [
-      type: :boolean,
-      default: false,
-      doc: """
-      When `true`, messages with the same `ordering_key` are routed to the
-      same Broadway processor and processed sequentially. This guarantees
-      in-order delivery for ordered subscriptions.
-
-      Ordering is enforced via Broadway's built-in `:partition_by` option,
-      which assigns messages with the same `orderingKey` metadata to the
-      same processor partition. The subscription itself must also have
-      message ordering enabled in Google Cloud Pub/Sub.
-
-      When `false` (default), messages are distributed across processors
-      without regard to ordering key, matching the unordered behaviour of a
-      standard Pub/Sub subscription.
-
-      Note: the server will also report whether the subscription has ordering
-      enabled in each `StreamingPullResponse.subscription_properties`. This
-      client-side option controls whether to enforce it in the Broadway
-      processing topology.
+      Interval in milliseconds at which HTTP/2 PING frames are sent on the gRPC
+      connection to keep it alive. This prevents Google Cloud's load balancer
+      from closing idle connections (which it does after roughly 20 seconds by
+      default). Only applies to the `:gun` adapter.
       """
     ],
     interceptors: [
@@ -285,34 +292,36 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       A list of client-side gRPC interceptors attached to every channel opened
       by the producer (both the StreamingPull channel and the unary ack/modack channel).
 
-      Each entry is either a bare module or a `{module, opts}` tuple:
+          Each entry is either a bare module (e.g. `MyInterceptor`, which calls
+          `MyInterceptor.init([])`) or a `{module, opts}` tuple (e.g.
+          `{MyInterceptor, level: :debug}`, which calls
+          `MyInterceptor.init(level: :debug)`).
 
-        * `MyInterceptor` — calls `MyInterceptor.init([])` to initialise.
-        * `{MyInterceptor, level: :debug}` — calls `MyInterceptor.init(level: :debug)`.
+          Modules must implement the `GRPC.Client.Interceptor` behaviour (`init/1` and `call/4`).
 
-      Modules must implement the `GRPC.Client.Interceptor` behaviour (`init/1` and `call/4`).
+          ## Example
 
-      ## Example
-
-          interceptors: [GRPC.Client.Interceptors.Logger]
-          interceptors: [{GRPC.Client.Interceptors.Logger, level: :warning}]
+              interceptors: [GRPC.Client.Interceptors.Logger]
+              interceptors: [{GRPC.Client.Interceptors.Logger, level: :warning}]
       """
     ],
+
+    # -- Advanced --
     grpc_client: [
       type: {:custom, __MODULE__, :type_grpc_client, [[]]},
       default: BroadwayCloudPubSub.Streaming.GrpcClient,
       doc: """
       The module implementing the `BroadwayCloudPubSub.Streaming.Client` behaviour.
-      Defaults to `BroadwayCloudPubSub.Streaming.GrpcClient`, which uses the
-      `grpc` library to communicate with Google Cloud Pub/Sub.
+      The built-in `BroadwayCloudPubSub.Streaming.GrpcClient` uses the `grpc`
+      library to communicate with Google Cloud Pub/Sub.
 
-      Accepts either a bare module or a `{module, opts}` tuple. When a tuple is
-      given, `opts` are merged into the producer options and passed to
-      `c:BroadwayCloudPubSub.Streaming.Client.init/1`:
+          Accepts either a bare module or a `{module, opts}` tuple. When a tuple is
+          given, `opts` are merged into the producer options and passed to
+          `c:BroadwayCloudPubSub.Streaming.Client.init/1`:
 
-          grpc_client: {MyGrpcClient, channel_opts: [transport_opts: []]}
+              grpc_client: {MyGrpcClient, channel_opts: [transport_opts: []]}
 
-      Swap this for testing or custom gRPC transports.
+          Swap this for testing or custom gRPC transports.
       """
     ],
     telemetry_metadata: [
@@ -322,15 +331,13 @@ defmodule BroadwayCloudPubSub.Streaming.Options do
       producer. The value is included in the event metadata under the `:extra`
       key.
 
-      Accepts either:
+          Accepts either a static term (e.g. a map or keyword list), which is
+          stored once and included verbatim in every event, or an
+          `{module, function, args}` tuple that is called on every event emission
+          and whose return value is used as the `:extra` value (useful for
+          attaching dynamic data such as node names or runtime counters).
 
-        * A static term (e.g. a map or keyword list) — stored once and
-          included verbatim in every event.
-        * An `{module, function, args}` tuple — called on every event
-          emission; its return value is used as the `:extra` value. Useful
-          for attaching dynamic data such as node names or runtime counters.
-
-      When not set, no `:extra` key is added to event metadata.
+          When not set, no `:extra` key is added to event metadata.
       """
     ],
 
